@@ -1,0 +1,327 @@
+/**
+ * Design tokens — the single source of truth for every color, radius, border
+ * and font value in the application.
+ *
+ * Rules (from AGENTS.md, "Established visual language"):
+ *   - Near-black background, off-white foreground (never pure white).
+ *   - Muted gray-blue for secondary/inactive text.
+ *   - ONE functional accent, used only for focus/active/selection.
+ *   - Secondary colors only for functional signaling (error, warn, ok).
+ *   - Monospace typography throughout.
+ *   - Zero border-radius. Thin 1px borders, accent-colored only when focused.
+ *   - No shadows, no gradients, no skeuomorphism, flat hover states.
+ *
+ * Tailwind's default palette, radius scale, shadow scale and font stacks are
+ * reset to `initial` below. That is deliberate: it makes `bg-white`,
+ * `rounded-lg` and `shadow-md` produce *no utility at all*, so a component that
+ * tries to invent its own palette or corner radius fails visibly instead of
+ * quietly drifting from the design language.
+ */
+
+/*
+ * `source(none)` disables Tailwind's automatic source detection, which is
+ * rooted at the project directory and — with no git repo to supply ignore
+ * rules — would otherwise crawl `src-tauri/target/`, `dist/`, and the markdown
+ * in `prompts/`. Scanning prose also lets a word in a spec become a utility
+ * class. The two explicit sources below are the only places class names exist.
+ */
+@import "tailwindcss" source(none);
+
+/*
+ * dockview's structural stylesheet. It ships no colors of its own worth
+ * keeping — everything visual is a `--dv-*` custom property, which
+ * `.dockview-theme-workspace` below binds to our design tokens. Imported here
+ * rather than from a component so the cascade order is explicit: dockview
+ * first, our overrides after.
+ */
+@import "dockview/dist/styles/dockview.css";
+
+@source "../**/*.{ts,tsx}";
+@source "../../index.html";
+
+@theme {
+  /* ---- Reset Tailwind's defaults so only our tokens exist ---- */
+  --color-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+  --inset-shadow-*: initial;
+  --drop-shadow-*: initial;
+  --font-*: initial;
+
+  /* ---- Keep the two non-color color keywords ---- */
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  /* ---- Surfaces (near-black) ---- */
+  --color-bg: #0d1117;
+  --color-surface: #0f111a;
+  --color-surface-raised: #161b22;
+  --color-surface-hover: #1c2128;
+
+  /* ---- Text ---- */
+  --color-fg: #e6edf3;
+  --color-fg-dim: #b3bcc4;
+  --color-muted: #818d92;
+  --color-disabled: #4d565c;
+
+  /* ---- The single functional accent: focus / active / selection only ---- */
+  --color-accent: #2979ff;
+  --color-accent-dim: #1c4f9c;
+  --color-accent-fg: #ffffff;
+  --color-selection: #2979ff40;
+
+  /* ---- Borders: 1px, subtle by default, accent when focused/active ---- */
+  --color-border: #21262d;
+  --color-border-strong: #30363d;
+  --color-border-accent: var(--color-accent);
+
+  /*
+   * The edge between tiles, and the only border that must stay legible on its
+   * own. `--color-border` sits at roughly 1.2:1 against the background, which
+   * is right for dividing content inside a panel and useless for dividing the
+   * panels themselves — an unfocused tile drawn with it has no visible edge at
+   * all. This is ~1.9:1: still quiet, but actually present.
+   */
+  --color-tile-border: #3d444d;
+
+  /* ---- Functional signaling only. Never decorative. ---- */
+  --color-error: #f85149;
+  --color-warn: #d29922;
+  --color-ok: #3fb950;
+
+  /* ---- Typography: monospace everywhere ---- */
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-sans: var(--font-mono);
+  --font-serif: var(--font-mono);
+
+  /* ---- The only border width the design language uses ---- */
+  --border-width-hairline: 1px;
+}
+
+@layer base {
+  /*
+   * Tailwind v4 defaults `border-color` to `currentColor`. Everything in this
+   * app uses the subtle border token unless it explicitly opts into the accent.
+   */
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    background-color: var(--color-bg);
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    /*
+     * The workspace fills the window and every scrollable region owns its own
+     * scrolling. The page itself never scrolls (re-verified in phase 08).
+     */
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  ::selection {
+    background-color: var(--color-selection);
+    color: var(--color-fg);
+  }
+
+  /* Flat focus: a 1px accent ring, no glow, no radius. */
+  :focus-visible {
+    outline: 1px solid var(--color-accent);
+    outline-offset: -1px;
+  }
+
+  /* Thin, flat scrollbars in the muted palette. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border-strong);
+    border: 2px solid var(--color-bg);
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-muted);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * The dockview theme.
+ *
+ * dockview is themed entirely through CSS custom properties, so the docking
+ * library consumes the same tokens as everything else rather than shipping a
+ * second palette. The JavaScript half of the theme — the gap, the drop overlay
+ * behaviour — is in `src/shell/docking/theme.ts`; the class name is shared
+ * between the two.
+ *
+ * Every value below is a token or a token-derived color. Nothing here invents
+ * one, and there are no radii, shadows or gradients.
+ * ------------------------------------------------------------------------ */
+
+.dockview-theme-workspace {
+  /* Surfaces */
+  --dv-group-view-background-color: var(--color-bg);
+  --dv-tabs-and-actions-container-background-color: var(--color-surface);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--color-surface-raised);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--color-surface);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--color-surface);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--color-surface);
+
+  /* Tab text: the same four-step hierarchy the rest of the app uses. */
+  --dv-activegroup-visiblepanel-tab-color: var(--color-fg);
+  --dv-activegroup-hiddenpanel-tab-color: var(--color-muted);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--color-fg-dim);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--color-disabled);
+
+  /*
+   * Separators and sashes.
+   *
+   * `--dv-separator-border` is off, and that is the whole fix for tiles that
+   * appeared to have no edge. dockview draws it as a `::before` on every split
+   * view child *except the first*, pinned to that child's leading edge at
+   * `z-index: 5` — so it paints on top of the tile's own left or top border.
+   * Because the master is the first child at every level of the grid, it was
+   * the only tile whose four borders all survived; every other tile had its
+   * leading edges replaced by this line, and the line was `--color-border`
+   * (1.23:1, the token AGENTS.md says is unusable for structural edges), so
+   * they read as borderless. It broke the focused tile's accent ring too:
+   * measured on a four-tile layout, the active tile's right edge was
+   * `rgb(41,121,255)` and its top and left edges `rgb(33,38,45)`.
+   *
+   * With it off, every tile owns all four of its edges (see "Tile edges"
+   * below), which is dwm's model exactly: 1px at the workspace boundary, 2px
+   * between neighbours where two tiles' borders abut. `selftest.ts` asserts
+   * nothing paints over a tile edge so this cannot come back.
+   */
+  --dv-separator-border: transparent;
+  --dv-tab-divider-color: var(--color-border);
+  --dv-paneview-header-border-color: var(--color-border);
+  --dv-sash-color: transparent;
+  --dv-active-sash-color: var(--color-accent);
+  --dv-active-sash-transition-duration: 0s;
+  --dv-active-sash-transition-delay: 0s;
+
+  /* Drag-and-drop feedback: a flat accent wash plus a 1px accent edge. */
+  --dv-drag-over-background-color: var(--color-selection);
+  --dv-drag-over-border-color: var(--color-accent);
+  --dv-drag-over-border: 1px solid var(--color-accent);
+  --dv-paneview-active-outline-color: var(--color-accent);
+
+  /* Context menu, so dockview's own menu matches our surfaces. */
+  --dv-context-menu-background-color: var(--color-surface-raised);
+  --dv-context-menu-color: var(--color-fg-dim);
+
+  /* Scrollbars inside the tab strip. */
+  --dv-tabs-container-scrollbar-color: var(--color-border-strong);
+  --dv-scrollbar-background-color: var(--color-border-strong);
+  --dv-icon-hover-background-color: var(--color-surface-hover);
+
+  /* Typography and metrics. Zero radius everywhere, no exceptions. */
+  --dv-tabs-and-actions-container-font-size: inherit;
+  --dv-tabs-and-actions-container-height: 26px;
+  --dv-tab-font-size: inherit;
+  --dv-tab-close-icon-size: inherit;
+  --dv-tab-margin: 0;
+  --dv-spacing-padding: 0px;
+  --dv-border-radius: 0px;
+  --dv-tab-border-radius: 0px;
+  --dv-sash-border-radius: 0px;
+  --dv-dropdown-border-radius: 0px;
+  --dv-tab-group-chip-border-radius: 0px;
+  --dv-tab-group-chip-padding: 0 4px;
+  --dv-tab-group-chip-font-size: inherit;
+  --dv-tab-group-line-height: 1px;
+  --dv-tab-group-line-opacity: 1;
+  --dv-overlay-z-index: 40;
+  --dv-transition-duration: 0s;
+
+  /* No shadows, and no floating chrome to put them on. */
+  --dv-floating-box-shadow: none;
+  --dv-floating-border: 1px solid var(--color-border-strong);
+  --dv-floating-group-border: 1px solid var(--color-border-strong);
+}
+
+/*
+ * Tile edges.
+ *
+ * Every tile carries a 1px border on all four sides at all times — quiet
+ * normally, accent when focused. Only the *color* changes, so focus never
+ * reflows anything by a pixel.
+ *
+ * The colour is `--color-tile-border`, not `--color-border`. Two earlier
+ * attempts at this failed for the same underlying reason — the edge was there
+ * in the DOM and invisible on screen. First it was drawn transparent when
+ * unfocused; then it was drawn in `--color-border`, which measures 1.23:1
+ * against the background and disappears at 1px. A tile edge is the primary
+ * structural division in a tiling workspace and has to be legible without
+ * being loud. `selftest.ts` asserts the contrast so this cannot regress a
+ * third time.
+ *
+ * `border` rather than `outline` on purpose: a group's content is rendered
+ * into dockview's overlay layer, which paints above the group element. An
+ * outline is drawn outside the border box and would be covered along exactly
+ * the edges that matter; a border reserves space, so the content container
+ * starts inside it and cannot cover it.
+ *
+ * The third failure was not this rule at all — the border was drawn correctly
+ * and something else painted over it. See `--dv-separator-border` above. Two
+ * tiles side by side therefore show 2px between them and 1px at the workspace
+ * boundary, which is what dwm gives you at `borderpx = 1`; the doubling is the
+ * two tiles each owning their own edge, not a stray extra line.
+ */
+.dockview-theme-workspace .dv-groupview {
+  border: 1px solid var(--color-tile-border);
+}
+
+.dockview-theme-workspace .dv-groupview.dv-active-group {
+  border-color: var(--color-accent);
+}
+
+/* Separates a tile's tab strip from its content, at every focus state. */
+.dockview-theme-workspace .dv-groupview > .dv-tabs-and-actions-container {
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* dockview's context menu, flattened to the app's language. */
+.dockview-theme-workspace .dv-context-menu,
+.dv-context-menu {
+  border: 1px solid var(--color-border-strong);
+  border-radius: 0;
+  box-shadow: none;
+  font-family: var(--font-mono);
+}
+
+.dv-context-menu-item:hover {
+  background-color: var(--color-surface-hover);
+  color: var(--color-fg);
+}
+
+.dv-context-menu-item--disabled {
+  color: var(--color-disabled);
+}

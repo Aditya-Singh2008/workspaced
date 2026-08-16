@@ -1,0 +1,942 @@
+/*
+ * Structural CSS for the video viewer.
+ *
+ * Lives with the plugin rather than in `src/theme/theme.css` for the same
+ * reason `viewers/image/image.css` and `viewers/pdf/pdf.css` do: none of it is
+ * palette. It is the geometry a stage needs, plus the timeline, the caption
+ * overlay, the inspector and the menu. Every colour is a design token, and there
+ * are no radii, shadows or gradients (AGENTS.md, "Established visual language").
+ *
+ * Three deliberate exceptions, none of which is chrome:
+ *
+ *   - The stage is black, not `--color-bg`. Letterbox bars around a film are
+ *     black in every player and every cinema because the surround has to read as
+ *     absence of picture; a themed grey around a dark scene shifts the apparent
+ *     black level of the image itself, which is the one thing someone checking a
+ *     grade must not have done to them.
+ *   - Captions are white on a semi-transparent black plate. Subtitles are read
+ *     against arbitrary moving imagery, and legibility there is a solved problem
+ *     with one answer. A themed caption would be unreadable over half the films
+ *     it was drawn on.
+ *   - The overlays — the chrome, the inspector, the message line — sit on a
+ *     translucent black rather than on `--color-surface`. They are drawn over
+ *     moving picture, where an opaque themed panel would be a hole cut in the
+ *     film; the transparency is what makes them read as *over* it. Their text
+ *     and borders are ordinary tokens.
+ *
+ * ## Everything but the picture is positioned
+ *
+ * The viewer has exactly one child in flow — the stage — and every other piece
+ * is absolutely positioned inside it. Nothing takes a strip of layout away from
+ * the video, which is what makes a tile in a four-way split still a player
+ * rather than a bar with a thumbnail above it. `engine/view.ts` explains the
+ * behaviour; this file is where it stops taking up room.
+ */
+
+.video-viewer {
+  position: relative;
+  display: flex;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  flex-direction: column;
+  background-color: var(--color-bg);
+}
+
+/* ---------------------------------------------------------------------------
+ * The picture
+ * ------------------------------------------------------------------------ */
+
+.video-stage {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  flex-grow: 1;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  /* See the header: the surround is absence of picture, not surface. */
+  background-color: #000000;
+}
+
+/*
+ * A playing film with no chrome up has no cursor either. It is the one piece of
+ * chrome every player hides and the only one that was still being left on
+ * screen — and it is the piece that sits *on* the picture rather than beside it.
+ *
+ * The second rule is not redundant: the stage sets its own cursor when the
+ * picture can be panned, and a rule on the ancestor alone would lose to it.
+ */
+.video-viewer.is-idle {
+  cursor: none;
+}
+
+.video-viewer.is-idle .video-stage {
+  cursor: none;
+}
+
+/*
+ * Actual size and any explicit zoom scroll rather than shrinking: a 4K file in a
+ * small tile is meant to show a real 1:1 crop, and a picture zoomed past its
+ * tile is meant to be panned around. `fit` and `fill` are defined as sitting
+ * inside the tile and stay clipped.
+ */
+.video-stage.is-scrollable {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+/* Only when there is somewhere to go. `engine/view.ts` measures that. */
+.video-stage.can-pan {
+  cursor: grab;
+}
+
+.video-stage.is-panning {
+  cursor: grabbing;
+}
+
+.video-stage:focus-visible {
+  outline: 1px solid var(--color-accent);
+  outline-offset: -1px;
+}
+
+/*
+ * The picture's box, sized in CSS pixels by `engine/view.ts`, and the only thing
+ * in the stage's flow. Everything that draws the picture fills it absolutely, so
+ * the video and the hold canvas cannot drift out of alignment at any zoom.
+ *
+ * `margin: auto` rather than relying on the stage's `justify-content` — with a
+ * box larger than its scroll container, centring leaves the overflow at the
+ * start edge unreachable by scrolling, which is the classic flex-centred
+ * scroller bug and would make the top-left of a zoomed frame impossible to pan
+ * to. Auto margins collapse to zero when there is no free space, which is
+ * exactly the behaviour wanted in both cases.
+ */
+.video-frame {
+  position: relative;
+  flex: none;
+  margin: auto;
+}
+
+.video-surface,
+.video-hold {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+  height: 100%;
+  width: 100%;
+  /*
+   * A no-op in every mode but `fill`: the frame already carries the picture's
+   * aspect ratio, so there is nothing to letterbox inside it — the letterbox is
+   * the black stage around the frame. `fill` is the one mode whose box is the
+   * tile rather than the picture, and `cover` is what crops it to fit.
+   */
+  object-fit: contain;
+}
+
+.video-stage.is-fill .video-surface,
+.video-stage.is-fill .video-hold {
+  object-fit: cover;
+}
+
+/*
+ * The held frame, over the video and never in front of a pointer: the stage's
+ * click-to-play and context menu both test their event target, and a canvas
+ * taking hits would break both for as long as reverse ran. See `engine/hold.ts`.
+ */
+.video-hold {
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Captions
+ *
+ * Positioned over the picture, out of the pointer's way. `bottom` is a
+ * percentage of the stage so the text sits inside the frame at any tile size
+ * rather than at a fixed offset that swallows it in a short tile.
+ *
+ * They lift when the chrome comes up. The alternative — leaving them where they
+ * are — puts a timeline through the middle of a subtitle for two and a half
+ * seconds after every mouse movement, which is worse than either position on
+ * its own. The transition matches the chrome's so the two move together.
+ * ------------------------------------------------------------------------ */
+
+/*
+ * The host is the full-tile layer the cues are positioned within; the cue block
+ * itself is what moves. Two elements rather than one because `CaptionOverlay`
+ * hides its own root when there is nothing to show, and a layer that disappears
+ * cannot be the thing a position is measured against.
+ */
+.video-caption-host {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+
+.video-captions {
+  position: absolute;
+  bottom: 6%;
+  left: 50%;
+  display: flex;
+  max-width: 90%;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.125rem;
+  transform: translateX(-50%);
+  transition: bottom 120ms ease-out;
+  pointer-events: none;
+  text-align: center;
+}
+
+/*
+ * Clear of the bar when there is one, and clear of a badge when there is one of
+ * those — the badges moved to this corner to sit with the bar, and a caption
+ * printed over a `◀◀ 2×` is the collision that move introduced. `has-chrome`
+ * wins when both are true, because the bar is the taller of the two.
+ */
+.video-viewer.has-badge .video-captions {
+  bottom: 2.5rem;
+}
+
+.video-viewer.has-chrome .video-captions {
+  bottom: 3.25rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-captions {
+    transition: none;
+  }
+}
+
+.video-caption-line {
+  border: 0;
+  background-color: rgb(0 0 0 / 60%);
+  padding: 0.0625rem 0.375rem;
+  color: #ffffff;
+  /* Cues carry their own line breaks and they are part of the timing. */
+  white-space: pre-line;
+}
+
+/* ---------------------------------------------------------------------------
+ * The chrome
+ *
+ * Three controls, floating over the bottom of the picture, fading out when the
+ * pointer stops. `engine/view.ts` owns when; this owns how.
+ *
+ * **No `contain` here**, and it is worth writing down because it looks like the
+ * obvious optimisation and is a bug. The bar's readout changes several times a
+ * second, so containing its layout to keep that off the rest of the tree is the
+ * first thing anyone would reach for — but every containment value that would
+ * help (`layout`, `paint`, `size`) also makes the element a containing block for
+ * `position: fixed` descendants, and `paint` clips them. The scrubber's hover
+ * preview is exactly that: a fixed-position frame deliberately escaping the
+ * bar's own bounds so it can be taller than the bar. Containment would position
+ * it against the bar and then clip it to a 28-pixel strip.
+ *
+ * The work it would have saved is small anyway. The timecode is fixed-width and
+ * tabular, so its box only reflows when the digit *count* changes — a few times
+ * a film — and everything on the timeline is an absolutely positioned
+ * percentage, which moves no sibling. The real saving is one level up: while the
+ * bar is hidden the instance does not update it at all (`engine/view.ts`).
+ * ------------------------------------------------------------------------ */
+
+.video-chrome {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  background-color: rgb(0 0 0 / 45%);
+  padding: 0.1875rem 0.5rem;
+  transition: opacity 120ms ease-out;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.video-chrome.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-chrome {
+    transition: none;
+  }
+}
+
+/*
+ * Fixed width, because `▶` and `❚❚` are not the same width and the timeline is
+ * next to it: without this, every play and pause shuffles the whole bar sideways
+ * by a couple of pixels.
+ */
+.video-button {
+  flex-shrink: 0;
+  min-width: 1.5rem;
+  border: 1px solid transparent;
+  padding: 0 0.25rem;
+  color: #ffffff;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.video-button:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  background-color: rgb(255 255 255 / 12%);
+}
+
+/*
+ * Tabular figures and a fixed width. A timecode that reflows the scrubber every
+ * time the seconds tick from 9 to 10 is unusable to look at — and with the bar
+ * contained, its width is the one thing that could still move the timeline.
+ */
+.video-time {
+  flex-shrink: 0;
+  /*
+   * Sized for `00:00:00 / 00:00:00`, and allowed to grow past it rather than
+   * wrap: a file long enough to need a third hour digit, or a frame-accurate
+   * timecode with its `:ff` field, is wider than the common case and a timecode
+   * broken over two lines would make the bar taller than the picture needs it.
+   */
+  min-width: 9.5rem;
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* A shuttle is a transient state, not a setting; the readout says so. */
+.video-time.is-shuttling {
+  color: var(--color-accent);
+}
+
+/*
+ * The speed chip: a readout that is also the control.
+ *
+ * Borderless until it is pointed at, because at 1× it is carrying no news and a
+ * bordered button sitting permanently in the corner of every video tile is
+ * exactly the clutter the rest of this bar was stripped back to avoid.
+ *
+ * Wide enough for `1×`, `1.5×` and `2×` so cycling between them does not shuffle
+ * the timeline sideways, and no wider: the `◀◀ 2×` of reverse is allowed to grow
+ * it, because that costs the timeline half a centimetre once when `J` is pressed
+ * rather than permanently in every tile that never reverses at all.
+ */
+.video-speed {
+  flex-shrink: 0;
+  min-width: 2.75rem;
+  border: 1px solid transparent;
+  padding: 0 0.25rem;
+  color: rgb(255 255 255 / 70%);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.video-speed:hover {
+  border-color: var(--color-border-strong);
+  background-color: rgb(255 255 255 / 12%);
+  color: #ffffff;
+}
+
+/* Off 1×, or running backwards — an active state, which is what the accent is for. */
+.video-speed.is-active {
+  color: var(--color-accent);
+}
+
+.video-scrubber-host {
+  min-width: 0;
+  flex-grow: 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * The timeline
+ *
+ * Modelled on mpv's seekbar: one thin flat bar, nothing standing above or below
+ * it while the pointer is elsewhere, and no colour that is not carrying
+ * information. The track is a comfortable pointer target and the bar drawn
+ * inside it is three pixels, so what you hit and what you see are different
+ * sizes on purpose.
+ *
+ * Every layer is absolutely positioned inside the track and sized as a fraction
+ * of it, so nothing measures the DOM during a scrub. The two that move
+ * continuously — the played fill and the position marker — are positioned by
+ * `transform` rather than by `width`/`left`, because `engine/glide.ts` animates
+ * them along the film's duration and a composited transform is the only way that
+ * costs nothing per frame. Their vertical centring is therefore a negative
+ * margin rather than a `translateY`: the animation owns `transform` outright and
+ * would drop any translation that shared it.
+ * ------------------------------------------------------------------------ */
+
+.video-scrubber {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.video-track {
+  position: relative;
+  height: 0.875rem;
+  width: 100%;
+  cursor: pointer;
+}
+
+/*
+ * The bar itself is drawn as a child rather than as the track's background so
+ * the track can stay a comfortable pointer target — a 3px-tall hit area is
+ * miserable to hit and a 3px-tall bar is what a timeline should look like.
+ */
+.video-track::before {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  height: 0.1875rem;
+  width: 100%;
+  margin-top: -0.09375rem;
+  /*
+   * White alphas rather than border tokens, here and for the buffered bar. The
+   * timeline sits on the translucent plate over the picture now, not on
+   * `--color-surface`, and a border-grey track over a bright scene disappears
+   * into it. Alpha over the plate keeps the same contrast whatever is playing.
+   */
+  background-color: rgb(255 255 255 / 18%);
+  content: "";
+}
+
+.video-track-buffered,
+.video-track-played {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  height: 0.1875rem;
+  width: 100%;
+  margin-top: -0.09375rem;
+  transform: scaleX(0);
+  transform-origin: left center;
+  pointer-events: none;
+}
+
+/*
+ * No `will-change` here, unlike the two parts below: how much of a file has been
+ * downloaded changes a few times a minute, and promising the compositor a layer
+ * for it would hold one open for the life of every video tile to save nothing.
+ */
+.video-track-buffered {
+  background-color: rgb(255 255 255 / 30%);
+}
+
+/*
+ * White rather than the accent, and it is not a preference: AGENTS.md reserves
+ * the accent for active states, and "some of this film has been played" is not
+ * one — it is true of every timeline that has ever been looked at. Spending the
+ * accent here left nothing to say the two things that *are* active states with
+ * it, which is what the loop region and the rule below now use it for.
+ */
+.video-track-played {
+  background-color: rgb(255 255 255 / 92%);
+  will-change: transform;
+}
+
+/* Running backwards: the one moment the bar is doing something worth colouring. */
+.video-track.is-reversing .video-track-played {
+  background-color: var(--color-accent);
+}
+
+/*
+ * The A/B loop region. Taller than the played bar and behind it, so the loop
+ * reads as a span *of* the timeline rather than as another progress bar
+ * competing with it.
+ */
+.video-track-loop {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  height: 0.5rem;
+  transform: translateY(-50%);
+  border-left: 1px solid var(--color-accent);
+  border-right: 1px solid var(--color-accent);
+  background-color: rgb(255 255 255 / 15%);
+  pointer-events: none;
+}
+
+.video-track-loop.is-active {
+  background-color: rgb(255 255 255 / 28%);
+}
+
+.video-track-chapters {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+}
+
+/*
+ * A chapter mark is a real button: it is clickable, focusable in principle, and
+ * carries the chapter title as its accessible name. One pixel wide would be
+ * unhittable, so the hit area is wider than the mark and transparent around it.
+ */
+.video-chapter-mark {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  width: 0.5rem;
+  border: 0;
+  background-color: transparent;
+  transform: translateX(-50%);
+  padding: 0;
+}
+
+/*
+ * A notch cut into the bar rather than a tick standing above it. Drawn dark and
+ * clipped to the bar's own height, so a film with forty chapters reads as a
+ * dashed line instead of as a picket fence over the controls — which is mpv's
+ * treatment, and the whole of "minimal clutter" applied to the one element that
+ * can appear dozens of times.
+ */
+.video-chapter-mark::before {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  height: 0.1875rem;
+  width: 1px;
+  margin-top: -0.09375rem;
+  transform: translateX(-50%);
+  background-color: rgb(0 0 0 / 70%);
+  content: "";
+}
+
+.video-chapter-mark:hover::before {
+  background-color: var(--color-accent);
+}
+
+/*
+ * A full-width strip translated from 0% to 100% of the track. The handle hangs
+ * off it rather than positioning itself, because a percentage in a `translateX`
+ * resolves against the element's own width — a 2px handle translated by 50%
+ * would move one pixel. See `engine/scrubber.ts`.
+ */
+.video-track-marker {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  height: 0;
+  width: 100%;
+  transform: translateX(0);
+  pointer-events: none;
+  will-change: transform;
+}
+
+/*
+ * Hidden until the timeline is being used. Nothing protrudes from the bar while
+ * a film is simply playing, which is the state a player is in almost always;
+ * the moment the pointer is on the track — or dragging it from anywhere, which
+ * is what `is-scrubbing` covers and `:hover` does not — the exact position
+ * appears. Kept a rectangle rather than a knob: the theme is zero-radius.
+ */
+.video-track-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 0.625rem;
+  width: 0.125rem;
+  margin-top: -0.3125rem;
+  margin-left: -0.0625rem;
+  background-color: #ffffff;
+  transition: opacity 90ms ease-out;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.video-track:hover .video-track-handle,
+.video-scrubber.is-scrubbing .video-track-handle {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-track-handle {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * The hover preview
+ *
+ * Positioned in client coordinates by `engine/scrubber.ts`, which clamps it
+ * inside the tile. Fixed rather than absolute so the control bar's own bounds do
+ * not clip a preview that is taller than it.
+ * ------------------------------------------------------------------------ */
+
+.video-preview {
+  position: fixed;
+  z-index: 55;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface-raised);
+  padding: 0.125rem;
+  pointer-events: none;
+}
+
+.video-preview[hidden] {
+  display: none;
+}
+
+.video-preview-frame {
+  display: flex;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  background-color: #000000;
+}
+
+.video-preview-frame canvas {
+  display: block;
+}
+
+.video-preview-label {
+  color: var(--color-fg-dim);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------------------
+ * The inspector
+ *
+ * An overlay on the picture, not a column beside it.
+ *
+ * It used to be a real layout split, and the cost was that opening it resized
+ * the video — in a tile narrow enough to matter, which is most of them in a
+ * four-way split, a 19-rem column is most of the tile and the film was reduced
+ * to whatever was left. Reading a codec string should not reflow the thing the
+ * codec is decoding.
+ *
+ * So it floats at the top right, over the least interesting part of most frames,
+ * bounded to a share of the tile and scrolling inside that. The picture does not
+ * move when it opens, and closing it does not have to un-move it.
+ * ------------------------------------------------------------------------ */
+
+.video-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 3;
+  display: flex;
+  /*
+   * Wide enough for a codec string and a track's second line. Narrower turns
+   * "avc1.640028" and a five-part audio description into columns of ellipses,
+   * which defeats the point of showing them. Capped as a share of the tile as
+   * well, so a narrow tile gets a narrow panel rather than a panel wider than
+   * the video it is describing.
+   */
+  width: min(19rem, 70%);
+  max-height: 100%;
+  flex-direction: column;
+  overflow: hidden;
+  border-bottom: 1px solid var(--color-border);
+  border-left: 1px solid var(--color-border);
+  background-color: rgb(0 0 0 / 78%);
+  contain: layout paint style;
+}
+
+.video-panel[hidden] {
+  display: none;
+}
+
+.video-panel-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.5rem;
+}
+
+.video-panel-heading {
+  color: rgb(255 255 255 / 55%);
+}
+
+.video-panel-note {
+  color: rgb(255 255 255 / 55%);
+}
+
+.video-fields {
+  display: grid;
+  grid-template-columns: 7rem minmax(0, 1fr);
+  gap: 0 0.5rem;
+}
+
+.video-fields dt {
+  color: rgb(255 255 255 / 55%);
+  overflow-wrap: anywhere;
+}
+
+.video-fields dd {
+  color: rgb(255 255 255 / 88%);
+  overflow-wrap: anywhere;
+}
+
+/* --- track selection ---------------------------------------------------- */
+
+.video-track-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+.video-track-item {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  border: 1px solid transparent;
+  padding: 0.125rem 0.25rem;
+  color: rgb(255 255 255 / 88%);
+  text-align: left;
+}
+
+.video-track-item:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  background-color: rgb(255 255 255 / 12%);
+  color: #ffffff;
+}
+
+.video-track-item.is-selected {
+  color: #ffffff;
+}
+
+.video-track-item:disabled {
+  color: rgb(255 255 255 / 40%);
+}
+
+/* The marker column keeps selected and unselected rows on one baseline. */
+.video-track-label {
+  white-space: pre;
+}
+
+.video-track-detail {
+  color: rgb(255 255 255 / 55%);
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Why a track cannot be chosen, under the row it belongs to. Indented so it
+ * reads as belonging to that row rather than to the next one.
+ */
+.video-track-reason {
+  padding: 0 0.25rem 0.25rem 1rem;
+  color: rgb(255 255 255 / 55%);
+}
+
+/* --- chapters ----------------------------------------------------------- */
+
+.video-chapter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+.video-chapter-item {
+  display: grid;
+  width: 100%;
+  grid-template-columns: 4.5rem minmax(0, 1fr);
+  gap: 0.5rem;
+  border: 1px solid transparent;
+  padding: 0.125rem 0.25rem;
+  color: rgb(255 255 255 / 88%);
+  text-align: left;
+}
+
+.video-chapter-item:hover {
+  border-color: var(--color-border-strong);
+  background-color: rgb(255 255 255 / 12%);
+  color: #ffffff;
+}
+
+.video-chapter-time {
+  color: rgb(255 255 255 / 55%);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.video-chapter-title {
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------------
+ * The state badges
+ *
+ * Playback rate and direction, and the picture's scale. Both are states that
+ * survive being walked away from, so — unlike the chrome — these do not fade
+ * with the pointer: the question they answer ("why is this playing oddly", "why
+ * is this framed oddly") is asked at a moment when nothing is being touched.
+ *
+ * Bottom left, with the bar rather than opposite it: the rate badge and the
+ * bar's speed chip are one reading with two homes, and a reading that jumped
+ * from the top of the picture to the bottom depending on whether the pointer had
+ * moved recently would be worse than either position. It steps up over the bar
+ * when the bar is showing.
+ *
+ * Clear of the inspector on the right and of the message line's centre, so
+ * all three can be on screen at once without stacking.
+ *
+ * `engine/view.ts` writes an empty badge as `hidden`, so a tile playing forwards
+ * at 1× with the picture fitted has no badge in the tree at all rather than an
+ * empty box over the film.
+ * ------------------------------------------------------------------------ */
+
+.video-badges {
+  position: absolute;
+  bottom: 0.5rem;
+  left: 0.5rem;
+  z-index: 4;
+  display: flex;
+  gap: 0.25rem;
+  transform: translateY(0);
+  transition: transform 120ms ease-out;
+  pointer-events: none;
+}
+
+/*
+ * Above the bar rather than under it, when there is a bar. Only the zoom badge
+ * is ever in this position — the rate badge hands its reading to the chip in the
+ * bar and hides itself (`engine/view.ts`, `rateIndicator`) — so this is one
+ * element stepping aside rather than a stack of them.
+ *
+ * A transform rather than a second `bottom`, because this moves every time the
+ * pointer wakes the bar and goes idle again, and `bottom` is layout.
+ */
+.video-viewer.has-chrome .video-badges {
+  transform: translateY(-1.75rem);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-badges {
+    transition: none;
+  }
+}
+
+.video-badge {
+  background-color: rgb(0 0 0 / 70%);
+  padding: 0.125rem 0.375rem;
+  color: rgb(255 255 255 / 88%);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.video-badge[hidden] {
+  display: none;
+}
+
+/*
+ * The accent, which AGENTS.md reserves for active states — and a transport that
+ * is running backwards or off its normal speed is precisely one. It is the same
+ * signal the timecode gives while shuttling, in the one place that stays on
+ * screen after the timecode has gone.
+ */
+.video-badge.is-rate {
+  color: var(--color-accent);
+}
+
+/* ---------------------------------------------------------------------------
+ * The message line
+ *
+ * One transient line over the top of the picture, where there used to be a
+ * permanent notice strip and a status strip stacked under the video — two
+ * elements that were always in the layout so that one of them could occasionally
+ * have something to say.
+ *
+ * Top rather than bottom: the bottom belongs to the captions and the chrome, and
+ * a message that has to dodge both ends up dodging neither.
+ * ------------------------------------------------------------------------ */
+
+.video-message {
+  position: absolute;
+  top: 0.5rem;
+  left: 50%;
+  z-index: 4;
+  max-width: 90%;
+  transform: translateX(-50%);
+  background-color: rgb(0 0 0 / 70%);
+  padding: 0.125rem 0.5rem;
+  color: #ffffff;
+  overflow-wrap: anywhere;
+  /*
+   * Opacity, never `display: none` or `hidden`. The element is a live region and
+   * has to stay in the accessibility tree between messages for the next one to
+   * be announced at all — `engine/view.ts` sets this out where the announcement
+   * is written.
+   */
+  transition: opacity 120ms ease-out;
+  opacity: 0;
+  pointer-events: none;
+  text-align: center;
+}
+
+.video-message.is-visible {
+  opacity: 1;
+}
+
+.video-message.is-warning {
+  color: var(--color-warn);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .video-message {
+    transition: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * The tile's context menu
+ *
+ * Rendered outside the tile so the stage's `overflow` cannot clip it — see
+ * `engine/menu.ts`.
+ * ------------------------------------------------------------------------ */
+
+.video-menu {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  min-width: 14rem;
+  flex-direction: column;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface-raised);
+  padding: 0.125rem 0;
+  font-family: var(--font-mono);
+}
+
+.video-menu-item {
+  padding: 0.125rem 0.75rem;
+  color: var(--color-fg-dim);
+  text-align: left;
+  white-space: pre;
+}
+
+.video-menu-item:hover:not(:disabled) {
+  background-color: var(--color-surface-hover);
+  color: var(--color-fg);
+}
+
+.video-menu-item:disabled {
+  color: var(--color-disabled);
+}
+
+.video-menu-separator {
+  margin: 0.125rem 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+}

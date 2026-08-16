@@ -1,0 +1,576 @@
+/*
+ * Structural CSS for the PDF viewer.
+ *
+ * Lives with the plugin rather than in `src/theme/theme.css` because none of it
+ * is palette: it is the geometry a canvas-plus-text-layer page needs, plus the
+ * minimum of pdf.js's own `.textLayer` contract. Every colour is a design token
+ * and there are no radii, shadows or gradients (AGENTS.md, "Established visual
+ * language") — with one deliberate exception, the paper white on `.pdf-page`.
+ * That is not chrome, it is the document: a PDF page's background is white
+ * because the page is white, and tinting it with a surface token would be
+ * editing the content.
+ *
+ * pdf.js ships `pdfjs-dist/web/pdf_viewer.css`, which is ~4000 lines of full
+ * viewer chrome — toolbars, sidebars, annotation editors, its own palette. We
+ * import none of it and reproduce only the handful of `.textLayer` rules that
+ * are load-bearing for selection, so there is no second design language in the
+ * bundle. Keep this in step with the `.textLayer` block of that file when
+ * pdf.js is upgraded.
+ */
+
+.pdf-viewer {
+  position: relative;
+  display: flex;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  flex-direction: column;
+  background-color: var(--color-bg);
+}
+
+/* The only scrolling region in the tile. The page body never scrolls. */
+.pdf-scroller {
+  position: relative;
+  min-height: 0;
+  flex-grow: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.pdf-pages {
+  display: flex;
+  width: max-content;
+  min-width: 100%;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--pdf-page-gap, 12px);
+  padding: var(--pdf-page-gap, 12px);
+}
+
+/*
+ * A page is a sized box from the moment the document loads, whether or not it
+ * has been rendered. That is what keeps the scrollbar honest under
+ * virtualization: it never grows or jumps as pages arrive.
+ */
+.pdf-page {
+  position: relative;
+  flex-shrink: 0;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface);
+}
+
+.pdf-page.is-rendered {
+  /* Unrendered paper is a surface; rendered paper is the document's own white. */
+  background-color: #ffffff;
+}
+
+/*
+ * The canvas fills the box rather than being sized to its own bitmap, so a
+ * zoom is visible instantly at the old resolution and only gets sharp again
+ * when the re-render lands. Without this a pinch flickers through blank pages.
+ */
+.pdf-page-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  height: 100%;
+  width: 100%;
+}
+
+/* ---------------------------------------------------------------------------
+ * Inversion.
+ *
+ * One class on the pages container, and the browser's compositor does the rest.
+ * Three properties come free with doing it here rather than in the canvas: it
+ * runs on the GPU, flipping it costs one DOM write however many pages are live,
+ * and the canvas pixels are never touched — so a copied region still carries
+ * the document's own colours.
+ *
+ * `hue-rotate(180deg)` after the invert is what makes this readable rather than
+ * a photographic negative: inverting alone also inverts hue, so a blue diagram
+ * would come out orange. Rotating a half turn puts the hues back.
+ *
+ * The filter is on the canvas, not the page, deliberately — the text layer is a
+ * sibling, and inverting it would invert the selection highlight along with it.
+ * ------------------------------------------------------------------------ */
+
+.pdf-pages.is-inverted .pdf-page-canvas {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* Inverted paper, for the moment before a page's canvas has any pixels. */
+.pdf-pages.is-inverted .pdf-page.is-rendered {
+  background-color: #000000;
+}
+
+/* ---------------------------------------------------------------------------
+ * pdf.js text layer.
+ *
+ * Transparent spans positioned over the canvas, which is what makes selection
+ * follow logical reading order instead of pixel order. pdf.js writes the
+ * geometry through `--total-scale-factor` and its own custom properties; the
+ * rules below are the minimum that contract needs.
+ * ------------------------------------------------------------------------ */
+
+.pdf-page .textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  z-index: 1;
+  line-height: 1;
+  text-align: initial;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  opacity: 1;
+
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.pdf-page .textLayer.is-empty {
+  /* No text to select; let the pointer fall through to the page itself. */
+  pointer-events: none;
+}
+
+.pdf-page .textLayer :is(span, br) {
+  position: absolute;
+  color: transparent;
+  cursor: text;
+  white-space: pre;
+  transform-origin: 0% 0%;
+}
+
+.pdf-page .textLayer > :not(.markedContent),
+.pdf-page .textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+
+  --font-height: 0;
+  --scale-x: 1;
+  --rotate: 0deg;
+
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.pdf-page .textLayer .markedContent {
+  display: contents;
+}
+
+.pdf-page .textLayer span[role="img"] {
+  cursor: default;
+  user-select: none;
+}
+
+/*
+ * The app's selection colour, not pdf.js's `AccentColor` default.
+ *
+ * `color` is repeated here — and it is the load-bearing half of the rule. A
+ * selection pseudo-element that names a background and *not* a foreground lets
+ * the engine pick the foreground, and webkit2gtk picks the GTK theme's
+ * selected-text colour, overriding the `color: transparent` the spans carry.
+ * The result on a real document is the text layer becoming visible the moment
+ * it is selected: a second, differently-shaped copy of the words printed over
+ * the canvas's own — and on a scanned page, OCR text that is supposed to be
+ * invisible painted over the picture of the same words. pdf.js's own stylesheet
+ * has the same hole; it shows up here and not in their viewer because Firefox
+ * and Chromium leave transparent text transparent.
+ *
+ * `-webkit-text-fill-color` as well as `color`: the fill colour wins over
+ * `color` wherever both are set, so leaving it out would leave the same door
+ * open on a future webkit.
+ */
+.pdf-page .textLayer ::selection {
+  background-color: var(--color-selection);
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+.pdf-page .textLayer br::selection {
+  background: transparent;
+}
+
+/*
+ * pdf.js appends this sentinel so a drag past the last glyph still selects to
+ * the end of the page.
+ */
+.pdf-page .textLayer .endOfContent {
+  position: absolute;
+  display: block;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+}
+
+.pdf-page .textLayer.selecting .endOfContent {
+  top: 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Transient status line
+ *
+ * Collapsed to nothing when empty, so a tile showing no message is exactly as
+ * tall as one that has never shown one — no reflow when it appears.
+ * ------------------------------------------------------------------------ */
+
+.pdf-status {
+  flex-shrink: 0;
+  overflow: hidden;
+  height: 0;
+  border-top: 1px solid var(--color-border);
+  padding: 0 0.5rem;
+  color: var(--color-muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.pdf-status.is-visible {
+  height: auto;
+  padding: 0.125rem 0.5rem;
+}
+
+.pdf-status.is-warning {
+  color: var(--color-warn);
+}
+
+/* ---------------------------------------------------------------------------
+ * Search / reveal highlight
+ * ------------------------------------------------------------------------ */
+
+.pdf-highlight {
+  position: absolute;
+  z-index: 2;
+  border: 1px solid var(--color-accent);
+  background-color: var(--color-selection);
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Annotations (phase 05a)
+ *
+ * The layer is an SVG stretched over the page, with its viewBox in page points
+ * — so the browser does the zoom and a mark never has to be repositioned. It is
+ * above the text layer (z-index 1) and the reveal highlight (2), because while
+ * annotate mode is on the marks are what the pointer is for.
+ *
+ * Colours here are the *only* literal colours in the app outside the paper white
+ * above, and for the same reason: an annotation is content the user is adding to
+ * their document, not application chrome. The palette that surrounds it is
+ * chrome, and uses tokens like everything else. See `annotation/overlay/tools.ts`.
+ * ------------------------------------------------------------------------ */
+
+.pdf-annot-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: block;
+  height: 100%;
+  width: 100%;
+  /* Marks are drawn, not clicked, until annotate mode says otherwise. */
+  pointer-events: none;
+  overflow: visible;
+}
+
+.pdf-annot-layer.is-interactive {
+  pointer-events: auto;
+}
+
+/*
+ * The one mark that stays clickable with the mode off.
+ *
+ * A sticky note's content is not on the page — the icon stands for text that
+ * has to be opened to be read — so requiring annotate mode to read one would
+ * mean entering an editing mode to look at a comment. The icon opts back into
+ * the pointer while the rest of the layer stays inert, and `annotate.ts` opens
+ * a read-only popup. Nothing else here changes: a drag still selects text.
+ */
+.pdf-annot-layer:not(.is-interactive) .pdf-annot-note {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+/*
+ * The wide transparent path under a thin stroke, so a hairline can be clicked.
+ * `visibleStroke` rather than the default: a `stroke: none` path is not a hit
+ * target at all, and a transparent one only is if it is asked to be.
+ */
+.pdf-annot-hit {
+  fill: transparent;
+  stroke: transparent;
+  pointer-events: all;
+}
+
+/*
+ * …but only while the tools are live.
+ *
+ * `pointer-events: none` on the layer does not stop a descendant that asks for
+ * the pointer back — that is the whole mechanism the note rule below relies on
+ * — so an invisible hit path stayed a hit target with annotate mode off, and a
+ * selection drag that crossed a highlighter stroke caught on nothing the user
+ * could see. Hit paths exist to make a hairline selectable, and nothing is
+ * selectable when the mode is off.
+ */
+.pdf-annot-layer:not(.is-interactive) .pdf-annot-hit {
+  pointer-events: none;
+}
+
+/*
+ * While annotating, the page belongs to the tools: the text layer stops taking
+ * the pointer so a drag draws rather than selecting text, and the cursor says
+ * so. Selection comes back the moment the mode is off.
+ */
+.pdf-viewer.is-annotating .textLayer {
+  pointer-events: none;
+}
+
+.pdf-viewer.is-annotating .pdf-page {
+  cursor: crosshair;
+}
+
+.pdf-viewer.is-annotating .pdf-annot-layer.is-interactive .pdf-annot {
+  cursor: move;
+}
+
+/*
+ * Inversion carries the marks with the document.
+ *
+ * The canvas filter is on `.pdf-page-canvas` alone, so without this a black
+ * callout would stay black on an inverted (dark) page and be unreadable. The
+ * same one-DOM-write, GPU-composited switch applies to the layer, and — exactly
+ * as with the canvas — the underlying values are untouched, so an export carries
+ * the colours the user actually chose.
+ */
+.pdf-pages.is-inverted .pdf-annot-layer {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* Selection chrome. Accent, 1px, no radius — the app's focus language. */
+.pdf-annot-outline {
+  fill: none;
+  stroke: var(--color-accent);
+  stroke-dasharray: 3 2;
+  pointer-events: none;
+}
+
+.pdf-annot-handle {
+  fill: var(--color-bg);
+  stroke: var(--color-accent);
+  cursor: pointer;
+}
+
+/* ---- The tool palette --------------------------------------------------- */
+
+/*
+ * Centred by layout rather than by `transform: translateX(-50%)`.
+ *
+ * A strip of odd width translated by half of itself lands on a half pixel, and
+ * a transformed subtree is rasterized off the pixel grid — which is why the
+ * palette's labels read soft until the whole webview is zoomed and the offset
+ * happens to land back on a whole pixel. Auto margins between two pinned edges
+ * centre the same box through layout, where positions are snapped, so the text
+ * is drawn on the grid at every zoom.
+ *
+ * It is also a size up from the original: this is the surface that says which
+ * tool and which colour are live, and at 13px in a 1.75rem chip that reading
+ * was a squint. Rows wrap so the wider strip still fits a narrow tile.
+ */
+.pdf-annot-palette {
+  position: absolute;
+  right: 0;
+  bottom: 0.5rem;
+  left: 0;
+  z-index: 6;
+  display: flex;
+  width: max-content;
+  max-width: calc(100% - 1rem);
+  flex-direction: column;
+  margin-inline: auto;
+  gap: 2px;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface);
+  padding: 3px;
+  font-size: 14px;
+}
+
+.pdf-annot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+}
+
+.pdf-annot-button {
+  min-width: 2.25rem;
+  height: 1.75rem;
+  border: 1px solid transparent;
+  padding: 0 0.4rem;
+  color: var(--color-muted);
+  line-height: 1.4;
+}
+
+.pdf-annot-button:hover:not(:disabled) {
+  background-color: var(--color-surface-hover);
+  color: var(--color-fg);
+}
+
+.pdf-annot-button:disabled {
+  color: var(--color-disabled);
+}
+
+/*
+ * The active chip carries the accent *and* the selection wash behind it. A 1px
+ * border alone is what the first version had, and on a strip of twenty chips at
+ * this size it was genuinely hard to find — the wash is the same token the app
+ * already uses to mean "this is the one", so it adds emphasis without adding a
+ * colour.
+ */
+.pdf-annot-button.is-active {
+  border-color: var(--color-accent);
+  background-color: var(--color-selection);
+  color: var(--color-fg);
+}
+
+/* A swatch shows its colour; the border is what says it is chosen. */
+.pdf-annot-swatch {
+  height: 1.25rem;
+  min-width: 1.25rem;
+  border: 1px solid var(--color-border-strong);
+  padding: 0;
+}
+
+.pdf-annot-swatch.is-active {
+  border-color: var(--color-accent);
+  border-width: 1px;
+  outline: 1px solid var(--color-accent);
+  outline-offset: 1px;
+}
+
+.pdf-annot-separator {
+  width: 1px;
+  align-self: stretch;
+  background-color: var(--color-border);
+  margin: 0 0.25rem;
+}
+
+.pdf-annot-count {
+  padding: 0 0.5rem;
+  color: var(--color-muted);
+}
+
+.pdf-annot-save.is-active,
+.pdf-annot-save:not(:disabled) {
+  color: var(--color-fg-dim);
+}
+
+/* ---- The selection popover (phase 05b) ---------------------------------- */
+
+/*
+ * Offered on a text selection, positioned against the selection's own box by
+ * `textAnnotate.ts` — so unlike everything else drawn over a page this one is
+ * in CSS pixels within the tile rather than in page percentages. It has to be:
+ * it points at what the browser has selected, which is a client-space fact.
+ *
+ * Above the annotation layer, below the tool palette. The two never coexist —
+ * the drawing tools take the pointer away from the text layer, so there is no
+ * selection to offer anything about — but a popover that would cover the
+ * palette if they ever did is not worth the argument.
+ */
+.pdf-text-popover {
+  position: absolute;
+  z-index: 6;
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface);
+  padding: 3px;
+  font-size: 14px;
+}
+
+/* ---- The text editor ---------------------------------------------------- */
+
+/*
+ * A real textarea over the mark, rather than a contenteditable SVG: the plain
+ * control is the one with an IME, a caret, selection and undo already working,
+ * and the keybind registry knows not to fire bare-letter shortcuts into it.
+ */
+.pdf-annot-editor {
+  position: absolute;
+  z-index: 7;
+  border: 1px solid var(--color-accent);
+  background-color: var(--color-surface);
+  padding: 2px;
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  line-height: 1.2;
+  resize: none;
+}
+
+/*
+ * The same bubble, read-only: what a sticky note says when it is clicked with
+ * annotate mode off. A border token rather than the accent, because the accent
+ * means "you are editing this" and nothing here can be edited. It takes the
+ * pointer so its text can be selected and copied, and `annotate.ts` treats a
+ * click inside it as reading rather than dismissing.
+ */
+.pdf-annot-note-popup {
+  position: absolute;
+  z-index: 7;
+  overflow: auto;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface-raised);
+  padding: 3px 5px;
+  color: var(--color-fg);
+  font-family: var(--font-mono);
+  line-height: 1.3;
+  overflow-wrap: break-word;
+  pointer-events: auto;
+  /* The newlines the user typed are the note's shape; nothing reflows them. */
+  white-space: pre-wrap;
+}
+
+.pdf-annot-note-popup.is-empty {
+  color: var(--color-muted);
+}
+
+/* ---------------------------------------------------------------------------
+ * Rasterised printing (Linux; see `print.ts`)
+ * ------------------------------------------------------------------------ */
+
+.pdf-print-host {
+  position: fixed;
+  left: -100000px;
+  top: 0;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+@media print {
+  /* While printing, the workspace is not what goes on the paper. */
+  .pdf-printing body > #root {
+    display: none;
+  }
+
+  .pdf-printing .pdf-print-host {
+    position: static;
+    left: auto;
+    width: auto;
+    height: auto;
+    overflow: visible;
+  }
+
+  .pdf-print-host canvas {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    break-after: page;
+  }
+
+  .pdf-print-host canvas:last-child {
+    break-after: auto;
+  }
+}

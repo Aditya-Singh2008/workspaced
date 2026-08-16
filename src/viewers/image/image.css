@@ -1,0 +1,360 @@
+/*
+ * Structural CSS for the image viewer.
+ *
+ * Lives with the plugin rather than in `src/theme/theme.css` for the same reason
+ * `viewers/pdf/pdf.css` does: none of it is palette. It is the geometry a
+ * scroller-plus-centred-image needs, plus the panel and menu layout. Every
+ * colour is a design token, and there are no radii, shadows or gradients
+ * (AGENTS.md, "Established visual language").
+ *
+ * The one non-token colour is the transparency checkerboard, and it is not
+ * chrome — it is the conventional way to draw "there is nothing here", and it
+ * has to read as neutral against any image rather than as part of the palette.
+ */
+
+.image-viewer {
+  position: relative;
+  display: flex;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  flex-direction: column;
+  background-color: var(--color-bg);
+}
+
+.image-body {
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  flex-grow: 1;
+}
+
+/*
+ * The only scrolling region in the tile, and the whole of panning — see
+ * `engine/view.ts`. Flex centring keeps a small image in the middle and a large
+ * one scrollable, with no special case for the transition between the two.
+ */
+.image-scroller {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  flex-grow: 1;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  overscroll-behavior: contain;
+  cursor: grab;
+}
+
+.image-scroller.is-panning {
+  cursor: grabbing;
+}
+
+.image-scroller:focus-visible {
+  outline: 1px solid var(--color-accent);
+  outline-offset: -1px;
+}
+
+/*
+ * The sized box the image sits centred inside. It carries the *rotated*
+ * dimensions; the image element inside it carries the unrotated ones and is
+ * turned by a transform. `margin: auto` is what centres it once it is larger
+ * than the flex line in one axis and smaller in the other.
+ */
+.image-frame {
+  position: relative;
+  flex: none;
+  margin: auto;
+}
+
+.image-display {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: block;
+  transform-origin: center;
+  /*
+   * Zoom is applied by setting `width`/`height`, never by scaling this
+   * transform — that is what re-rasterizes an SVG at each zoom level instead of
+   * stretching what it already painted. See `engine/view.ts`.
+   */
+}
+
+/*
+ * Past a few times life size, the pixel grid is the subject. Smoothing hides
+ * exactly what someone zoomed in to inspect, so above the threshold in
+ * `settings.ts` the sampling becomes nearest-neighbour.
+ */
+.image-display.is-pixelated {
+  image-rendering: pixelated;
+}
+
+/*
+ * Transparency, drawn as the conventional checkerboard. Without it a
+ * transparent PNG is indistinguishable from a black one on this app's near-black
+ * background, which is the single question most often being asked of a PNG.
+ */
+.image-viewer.is-checkered .image-frame {
+  background-color: #202020;
+  background-image:
+    linear-gradient(45deg, #2c2c2c 25%, transparent 25%),
+    linear-gradient(-45deg, #2c2c2c 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #2c2c2c 75%),
+    linear-gradient(-45deg, transparent 75%, #2c2c2c 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * The inspector panel
+ * ------------------------------------------------------------------------ */
+
+.image-panel {
+  display: flex;
+  /*
+   * Wide enough for a tag name and its value side by side. The information
+   * panel lists every tag in the file, and names like
+   * `SourceExposureTimesOfCompositeImage` are not unusual — a narrower panel
+   * would turn the exhaustive listing into a column of ellipses, which is not
+   * "available to see" in any sense that matters.
+   */
+  width: 19rem;
+  flex-shrink: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border-left: 1px solid var(--color-border);
+  background-color: var(--color-surface);
+}
+
+.image-panel[hidden] {
+  display: none;
+}
+
+/* The pixel readout, pinned above whichever panel is open. */
+.image-sample {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--color-border);
+  padding: 0.25rem 0.5rem;
+  color: var(--color-fg-dim);
+}
+
+.image-swatch {
+  display: inline-block;
+  height: 0.875rem;
+  width: 0.875rem;
+  flex-shrink: 0;
+  border: 1px solid var(--color-border-strong);
+}
+
+.image-panel-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  padding: 0.5rem;
+}
+
+.image-panel-heading {
+  color: var(--color-muted);
+}
+
+.image-panel-note {
+  color: var(--color-muted);
+}
+
+.image-fields {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 0 0.5rem;
+}
+
+/*
+ * Tag names wrap rather than truncate. Truncation would be tidier and would
+ * make two private tags that share a prefix indistinguishable — the listing
+ * exists to show what is in the file, so it has to show all of the name.
+ */
+.image-fields dt {
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
+
+.image-fields dd {
+  color: var(--color-fg-dim);
+  overflow-wrap: anywhere;
+}
+
+/* A withheld value. The row stays so the user knows the data is there. */
+.image-field-hidden {
+  color: var(--color-disabled);
+}
+
+/*
+ * The raw XMP packet: a document, not a value, so it takes both columns and
+ * keeps its own line breaks. Capped in height because an XMP packet can be tens
+ * of kilobytes and would otherwise push every section below it out of reach.
+ */
+.image-field-raw {
+  grid-column: 1 / -1;
+  max-height: 20rem;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  padding: 0.25rem;
+  color: var(--color-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------------------
+ * The loupe
+ *
+ * Positioned against the viewer root rather than the scroller, so it is not
+ * clipped when the pointer is near the edge of the image. `pointer-events: none`
+ * is load-bearing: the loupe follows the cursor, and an element that could
+ * receive the pointer would take the very events that move it.
+ * ------------------------------------------------------------------------ */
+
+.image-loupe {
+  position: absolute;
+  z-index: 30;
+  display: block;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-bg);
+  pointer-events: none;
+}
+
+.image-loupe[hidden] {
+  display: none;
+}
+
+.image-histogram {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--color-border);
+  background-color: var(--color-bg);
+}
+
+.image-panel-action {
+  align-self: flex-start;
+  border: 1px solid var(--color-border);
+  padding: 0.125rem 0.5rem;
+  color: var(--color-fg-dim);
+}
+
+.image-panel-action:hover:not(:disabled) {
+  background-color: var(--color-surface-hover);
+  color: var(--color-fg);
+}
+
+.image-panel-action:disabled {
+  color: var(--color-disabled);
+}
+
+.image-slider {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  color: var(--color-fg-dim);
+}
+
+.image-slider input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  accent-color: var(--color-accent);
+}
+
+.image-slider-value {
+  color: var(--color-muted);
+  text-align: right;
+}
+
+/* ---------------------------------------------------------------------------
+ * The notice line and the transient status line
+ *
+ * Two distinct things. The notice is a standing caveat about the file — a RAW
+ * preview, a truncated animation — and stays until the file changes. The status
+ * line is one-off feedback and clears itself. Both collapse to nothing when
+ * empty, so a tile showing neither is exactly as tall as one that has never
+ * shown either.
+ * ------------------------------------------------------------------------ */
+
+.image-notice {
+  flex-shrink: 0;
+  border-top: 1px solid var(--color-border);
+  padding: 0.125rem 0.5rem;
+  color: var(--color-warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.image-status {
+  flex-shrink: 0;
+  overflow: hidden;
+  height: 0;
+  border-top: 1px solid var(--color-border);
+  padding: 0 0.5rem;
+  color: var(--color-muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.image-status.is-visible {
+  height: auto;
+  padding: 0.125rem 0.5rem;
+}
+
+.image-status.is-warning {
+  color: var(--color-warn);
+}
+
+/* ---------------------------------------------------------------------------
+ * The tile's context menu
+ *
+ * Rendered into `document.body` so the scroller's `overflow` cannot clip it —
+ * see `engine/menu.ts`.
+ * ------------------------------------------------------------------------ */
+
+.image-menu {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  min-width: 12rem;
+  flex-direction: column;
+  border: 1px solid var(--color-border-strong);
+  background-color: var(--color-surface-raised);
+  padding: 0.125rem 0;
+  font-family: var(--font-mono);
+}
+
+.image-menu-item {
+  padding: 0.125rem 0.75rem;
+  color: var(--color-fg-dim);
+  text-align: left;
+  white-space: pre;
+}
+
+.image-menu-item:hover:not(:disabled) {
+  background-color: var(--color-surface-hover);
+  color: var(--color-fg);
+}
+
+.image-menu-item:disabled {
+  color: var(--color-disabled);
+}
+
+.image-menu-separator {
+  margin: 0.125rem 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+}
