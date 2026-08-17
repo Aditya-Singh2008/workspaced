@@ -21,9 +21,13 @@
  *     Iterator Helpers (`Iterator.prototype.*`), which webkit2gtk only ships
  *     from 2.48. Ubuntu 24.04 LTS is on 2.44. Taking 6.x would silently drop
  *     the Linux target AGENTS.md names first (see "Platform targets"), for no
- *     feature this plugin uses. 5.5.207 needs `Promise.withResolvers`, i.e.
- *     webkit2gtk 2.44+ / Safari 17.4+ / Chromium 119+, which is the baseline
- *     recorded in AGENTS.md.
+ *     feature this plugin uses.
+ *
+ * 5.5.207's own floor is **higher than pdf.js documents and higher than this
+ * file used to claim**: `Promise.try` (Safari 18.2) and `URL.parse` (18.0) are
+ * both called unguarded. `compat.ts` supplies those and two more so the app's
+ * stated floor is the real one; read it before touching the pin, and re-run the
+ * scan it describes when the pin moves.
  *
  * Revisit when a 6.x lands that this app's Linux floor can run.
  *
@@ -99,6 +103,12 @@
  * for the library itself. The `?url` copy below it is emitted for the
  * main-thread fallback and fetched only if the blob path failed outright.
  */
+
+// First, and deliberately: this module installs the built-ins pdf.js needs and
+// old webviews lack, and ES modules evaluate in declaration order, so putting
+// it above `pdfjs-dist` is what gets them in place before pdf.js's module body
+// runs. See `compat.ts` — the gap is why every PDF hung on macOS.
+import { PDF_COMPAT_SOURCE } from "./compat";
 
 import * as pdfjs from "pdfjs-dist";
 
@@ -201,7 +211,13 @@ function describe(thrown: unknown): string {
  * the second.
  */
 function workerSourceUrl(): string {
-  workerUrl ??= URL.createObjectURL(new Blob([pdfWorkerSource], { type: "text/javascript" }));
+  // The compat shim goes *in front of* pdf.js's own source. A worker is a
+  // separate global scope, so the copy installed on the main thread does
+  // nothing for the thread that actually decodes — and it is that thread which
+  // threw `Promise.try is not a function` and stopped answering.
+  workerUrl ??= URL.createObjectURL(
+    new Blob([PDF_COMPAT_SOURCE, pdfWorkerSource], { type: "text/javascript" }),
+  );
   return workerUrl;
 }
 
@@ -358,14 +374,22 @@ export function pdfWorkerMode(): PdfWorkerMode | "unresolved" {
 }
 
 /**
- * Ties `worker`'s lifetime to `task`'s.
+ * Ties `worker`'s lifetime — and its failures — to `task`'s.
  *
- * A `PDFWorker` built from a port does not own the worker behind it — pdf.js
- * only terminates workers it constructed itself — so the one thing this module
- * gains by constructing its own is the one thing it now has to clean up. Both
- * ways out are covered: `destroy()`, which is what a closing tile calls
- * (`PDFDocumentProxy.destroy` forwards to the loading task's), and a load that
- * rejected and will never be destroyed because it never produced a document.
+ * **Ownership.** A `PDFWorker` built from a port does not own the worker behind
+ * it — pdf.js only terminates workers it constructed itself — so the one thing
+ * this module gains by constructing its own is the one thing it now has to
+ * clean up. Both ways out are covered: `destroy()`, which is what a closing
+ * tile calls (`PDFDocumentProxy.destroy` forwards to the loading task's), and a
+ * load that rejected and will never be destroyed because it never produced a
+ * document.
+ *
+ * **Failures.** pdf.js watches for `error` on workers it built itself and falls
+ * back when one fires; on the port path it attaches nothing at all. That gap is
+ * not theoretical — it is how a `TypeError` thrown inside the worker's own
+ * message listener reached a user as a 45-second timeout with no cause attached
+ * (see `compat.ts`). An uncaught error over there is a failed load, and it is
+ * reported as itself.
  */
 function releaseWith(task: PdfLoadingTask, worker: Worker): PdfLoadingTask {
   let released = false;
@@ -374,6 +398,33 @@ function releaseWith(task: PdfLoadingTask, worker: Worker): PdfLoadingTask {
     released = true;
     worker.terminate();
   };
+
+  // Never resolves; only ever rejects. `Promise.race` below always attaches a
+  // handler, so a worker that dies *after* the document loaded settles nothing
+  // and goes unnoticed rather than surfacing as an unhandled rejection.
+  const workerFailed = new Promise<never>((_, reject) => {
+    worker.addEventListener(
+      "error",
+      (event) => {
+        // A blob worker reports its errors in full; the guard is for engines
+        // that reduce a cross-origin script error to an empty `ErrorEvent`.
+        const detail = event.message || "the decoder worker stopped with an error";
+        reject(new Error(`${detail}${event.lineno ? ` (line ${event.lineno})` : ""}`));
+      },
+      { once: true },
+    );
+    worker.addEventListener(
+      "messageerror",
+      () => reject(new Error("the decoder worker could not read a message it was sent")),
+      { once: true },
+    );
+  });
+
+  // Shadows the prototype getter, which is the same trick `destroy` below uses.
+  // Callers await `task.promise`; this is the only place that can widen what
+  // they are awaiting to include "the worker fell over".
+  const settled = Promise.race([task.promise, workerFailed]);
+  Object.defineProperty(task, "promise", { value: settled, configurable: true });
 
   const destroy = task.destroy.bind(task);
   task.destroy = async (): Promise<void> => {

@@ -58,12 +58,43 @@ const TITLE = "pdf viewer plugin";
 
 export async function runPdfSelfTest(): Promise<SelfTestReport> {
   const checks: SelfTestCheck[] = [];
+  checks.push(await engineBuiltInsCheck());
   checks.push(await workerModeCheck());
   const environment = await probeRenderEnvironment();
   checks.push(environment.check);
   checks.push(...(await lifecycleChecks(environment.canRender)));
   checks.push(await viewportAgreementCheck());
   return report(TITLE, checks);
+}
+
+/**
+ * Whether this webview has the built-ins pdf.js expects, and which ones it did
+ * not.
+ *
+ * The check that would have caught the *second* macOS hang, and the first one
+ * to read when a platform starts behaving differently from the others: it names
+ * the engine. An empty list means a current webview. A non-empty one means an
+ * old WebKit that `compat.ts` is carrying — the app works, and the reason it
+ * works is a polyfill rather than the platform. Only a built-in still *missing*
+ * after that is a failure, which would mean a polyfill did not take and the
+ * silent hang is back.
+ *
+ * First in the report because everything else in the suite, and everything in
+ * the plugin, is downstream of it.
+ */
+async function engineBuiltInsCheck(): Promise<SelfTestCheck> {
+  const { pdfCompatFilled, pdfCompatMissing } = await import("./compat");
+  const filled = pdfCompatFilled();
+  const missing = pdfCompatMissing();
+  return check(
+    "the webview has the built-ins pdf.js needs",
+    missing.length === 0,
+    missing.length > 0
+      ? `still missing after polyfilling: ${missing.join(", ")}`
+      : filled.length > 0
+        ? `polyfilled for this webview: ${filled.join(", ")}`
+        : "all present natively",
+  );
 }
 
 /**
