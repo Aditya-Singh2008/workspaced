@@ -14,9 +14,28 @@ import {
   type ViewerMountOptions,
 } from "../contract";
 import { MIN_TEXT_CHARS, PdfViewerInstance, TEXT_PROBE_PAGES } from "./instance";
-import { loadPdfDocument, pdfjs, type PdfDocument, type PdfLoadingTask } from "./pdfjs";
+import {
+  loadPdfDocument,
+  pdfjs,
+  withinDeadline,
+  type PdfDocument,
+  type PdfLoadingTask,
+} from "./pdfjs";
 
 import "./pdf.css";
+
+/**
+ * How long pdf.js gets to open a document before the tile gives up on it.
+ *
+ * Enormously generous, and meant to be: the bytes are already in memory by the
+ * time this starts, and `getDocument().promise` only has to reach the trailer
+ * and the catalog — pdf.js reads pages lazily after that. A file that needs
+ * three quarters of a minute to get that far is a file pdf.js is not going to
+ * open. The number exists for the failure this plugin has actually shipped,
+ * which is a promise that never settles at all (see `pdfjs.ts`), and AGENTS.md
+ * is explicit that a hang reports nothing and is strictly worse than a failure.
+ */
+const OPEN_MS = 45_000;
 
 /** The PDF magic number. Cheap, and a much better error than pdf.js's. */
 function looksLikePdf(bytes: Uint8Array): boolean {
@@ -152,8 +171,12 @@ export async function mountPdf(
 
   let document_: PdfDocument;
   try {
-    document_ = await task.promise;
+    document_ = await withinDeadline(task.promise, OPEN_MS, `opening ${file.name}`);
   } catch (thrown) {
+    // A rejected load leaves a task nothing else will ever close: there is no
+    // document, so no tile, so no `destroy()`. Idempotent, and the only cover
+    // for this exit when pdf.js is running on the main thread.
+    void task.destroy().catch(() => {});
     throw describeLoadFailure(thrown, file.name);
   }
 
@@ -166,14 +189,24 @@ export async function mountPdf(
     // Page 1's box seeds every placeholder, so the scrollbar is right before
     // anything is rendered. Pages that differ correct themselves on their first
     // real render (see `PdfPageView.render`).
-    const first = await document_.getPage(1);
+    const first = await withinDeadline(
+      document_.getPage(1),
+      OPEN_MS,
+      `reading the first page of ${file.name}`,
+    );
     const box = first.getViewport({ scale: 1 });
     const pageSizes = Array.from({ length: document_.numPages }, () => ({
       width: box.width,
       height: box.height,
     }));
 
-    const hasText = await probeForText(document_);
+    // Bounded for the same reason `task.promise` is: every await in here is
+    // pdf.js waiting on the worker, and pdf.js puts no deadline on any of them.
+    const hasText = await withinDeadline(
+      probeForText(document_),
+      OPEN_MS,
+      `checking ${file.name} for text`,
+    );
     options?.signal?.throwIfAborted();
 
     return new PdfViewerInstance({

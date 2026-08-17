@@ -27,49 +27,72 @@
  *
  * Revisit when a 6.x lands that this app's Linux floor can run.
  *
- * ## The worker is started from source, not from a URL
+ * ## pdf.js is never given a URL to resolve
  *
  * This is the fix for PDFs hanging on "loading" forever in the macOS bundle,
- * and the mechanism is worth writing down because nothing about it is visible
- * from a development run.
+ * and it is worth writing down because nothing about it is visible from a
+ * development run — and because the *first* fix for that hang was aimed at a
+ * branch the engine never takes. Both halves are recorded here so the wrong one
+ * is not re-derived.
  *
  * A bundled Tauri app is not served over `http`. `tauri_protocol_url` in
  * `tauri/src/manager/mod.rs` hands the webview `http://tauri.localhost` on
  * Windows and **`tauri://localhost` everywhere else**, macOS included, where a
- * `WKURLSchemeHandler` answers for the scheme. `tauri:` is not a *special*
- * scheme in the URL Standard, so `URL.parse("tauri://localhost").origin` is the
- * string `"null"` — and that one detail is the whole bug. pdf.js asks
- * `_isSameOrigin(window.location, workerSrc)`, gets `false` because the *base*
- * has no origin, and concludes the worker lives on a CDN. It then does what it
- * does for a CDN: builds a one-line blob, `await import("<the real URL>");`,
- * and starts *that* as the worker.
+ * `WKURLSchemeHandler` answers for the scheme. Every request the page makes for
+ * its own assets — including a worker's script — goes through that handler
+ * instead of a server, and **a request the handler does not drive does not
+ * fail; it never completes**. wry's macOS handler is explicit about it: on any
+ * of its validation paths it returns without calling `didFailWithError` or
+ * `didFinish` (`wry/src/wkwebview/class/url_scheme_handler.rs`), which leaves
+ * the load outstanding forever. Tauri issue #9975 is the same surface from the
+ * other side — a worker script fetched over the app's scheme in a macOS release
+ * build comes back as `index.html`, the SPA fallback, rather than as the asset.
  *
- * So the worker's first act is to fetch `tauri://localhost/assets/…` from
- * inside a worker context. WKWebView does not drive the scheme handler for that
- * request; it never completes and never fails. The import never settles, the
- * worker never sends its `ready`, and pdf.js — which has an error path but no
- * timeout — waits on a promise that will not settle. `getDocument().promise`
- * never resolves, the tile shows "loading" forever, and *nothing is logged*.
+ * So `new Worker("/assets/pdf.worker.min-….mjs")` is the thing that breaks: the
+ * worker's own script request goes to the scheme handler, the handler does not
+ * answer it, the worker never evaluates, and it never sends `ready`. pdf.js has
+ * an error path but no timeout, so `getDocument().promise` waits on a promise
+ * that will not settle. The tile shows "loading" forever and *nothing is
+ * logged*. None of it reproduces in `tauri dev`, where the frontend is
+ * `http://localhost:1420` and a real server answers.
  *
- * None of it reproduces in `tauri dev`, where the frontend is
- * `http://localhost:1420`, a real origin: same-origin, no wrapper, no
- * cross-scheme fetch, worker starts. The bug exists only in a bundle, and only
- * where the scheme handler is WKWebView's.
+ * **What is not the cause, despite looking like it.** pdf.js asks
+ * `_isSameOrigin(window.location, workerSrc)` and, when the base has no origin,
+ * decides the worker is on a CDN and wraps it in a blob that does
+ * `await import("<the real URL>")`. `tauri:` is not a special scheme in the URL
+ * Standard, so that branch *should* be taken — and on WebKit it is not.
+ * `URL.parse("tauri://localhost/…").origin` returns `"tauri://localhost"`
+ * there, not `"null"`: WebKit answers `URL.origin` from the document's
+ * `SecurityOrigin`, which for an ordinary custom scheme is an ordinary
+ * scheme/host tuple. Measured on webkit2gtk under a real `tauri://` scheme
+ * handler, with and without `register_uri_scheme_as_secure`. The CDN wrapper
+ * never runs on either WebKit port, so the patch that used to be here — pinning
+ * `PDFWorker._isSameOrigin` to `true` — was preventing something that was not
+ * happening. It is gone; do not put it back on the strength of the URL
+ * Standard alone.
  *
- * Two changes answer it, and each is doing a different job:
+ * The fix, then, is to leave pdf.js no URL to resolve at all:
  *
  *   1. **The worker's source is inlined at build time and run from a blob.**
- *      The worker then needs nothing from the app's scheme — no fetch, no
- *      import, no scheme handler — so the platform difference stops being
- *      reachable. `_isSameOrigin` is pinned to `true` alongside it so pdf.js
- *      does not wrap our blob in a second blob that imports it; that wrapper is
- *      what turns a working URL into a request, and the request is the problem.
- *   2. **The worker is measured before it is trusted.** {@link preparePdfWorker}
- *      starts one and waits for it to say hello. If it does not, the library is
- *      set up to run on the main thread instead — slower, and the UI judders
- *      while a page parses, but a slow PDF is a PDF and a hung one is not.
- *      AGENTS.md is explicit that a hang reports nothing and is strictly worse
- *      than a failure; this is that rule applied to the thing that hung.
+ *      Nothing about it reaches the app's scheme — no fetch, no import, no
+ *      scheme handler — so the platform difference stops being reachable.
+ *   2. **The worker is measured, and then that same worker is the one pdf.js
+ *      gets.** {@link startWorker} constructs it, waits for it to say hello,
+ *      and {@link loadPdfDocument} hands it over as `getDocument({ worker })`.
+ *      pdf.js then takes its `port` path, which never reads `workerSrc`, never
+ *      consults `_isSameOrigin`, and never calls `new Worker`. What was
+ *      measured is what runs; previously pdf.js built a second worker of its
+ *      own from a URL and the measurement only implied that it would work.
+ *   3. **Everything on the path has a deadline.** The handshake, the
+ *      main-thread fallback's imports, and the shutdown handshake in
+ *      {@link releaseWith}. AGENTS.md's rule is that a hang reports nothing and
+ *      is strictly worse than a failure; the platform difference here surfaces
+ *      as a hang rather than as an error, so every await that crosses it is
+ *      bounded and reports which bound it hit.
+ *
+ * If the worker cannot be started at all, the library is set up to run on the
+ * main thread instead — slower, and the UI judders while a page parses, but a
+ * slow PDF is a PDF and a hung one is not.
  *
  * `?raw` costs a copy of the worker in the plugin's chunk, which is a chunk
  * nothing loads until a PDF is opened — the same trade `index.ts` already makes
@@ -79,9 +102,9 @@
 
 import * as pdfjs from "pdfjs-dist";
 
-// The worker's *source*. See "The worker is started from source" above: this
-// replaced a `?url` import, and the difference between them is the difference
-// between opening a PDF on macOS and not.
+// The worker's *source*. See "pdf.js is never given a URL to resolve" above:
+// this replaced a `?url` import, and the difference between them is the
+// difference between opening a PDF on macOS and not.
 import pdfWorkerSource from "pdfjs-dist/build/pdf.worker.min.mjs?raw";
 // The same file, emitted as an asset. Only {@link runWorkerOnThisThread} reads
 // it, and only after the blob has already failed.
@@ -95,6 +118,18 @@ export type PdfRenderTask = pdfjs.RenderTask;
 export type PdfViewport = pdfjs.PageViewport;
 export type PdfLoadingTask = pdfjs.PDFDocumentLoadingTask;
 
+/**
+ * `getDocument`'s object form, which is the only one this plugin uses.
+ *
+ * Narrowed from pdf.js's own union so {@link loadPdfDocument} can add a
+ * `worker` to whatever it is handed without first having to work out whether it
+ * was handed a URL, a buffer or a parameter object.
+ */
+export type PdfSource = Exclude<
+  Parameters<typeof pdfjs.getDocument>[0],
+  string | URL | ArrayBuffer | ArrayBufferView | undefined
+>;
+
 /** The library version, for the dev self-test's report line. */
 export const PDFJS_VERSION: string = pdfjs.version;
 
@@ -102,7 +137,7 @@ export const PDFJS_VERSION: string = pdfjs.version;
  * Where the library ended up running.
  *
  * `worker` is the good case and the one every platform is expected to reach.
- * `main-thread` means the worker never answered and pdf.js is parsing and
+ * `main-thread` means no worker ever answered and pdf.js is parsing and
  * rendering on the UI thread — correct, and noticeably less smooth.
  */
 export type PdfWorkerMode = "worker" | "main-thread";
@@ -110,22 +145,60 @@ export type PdfWorkerMode = "worker" | "main-thread";
 /**
  * How long a freshly spawned worker has to say hello.
  *
- * Generous on purpose. It is paid once per session and only by a platform that
- * is already broken; a machine that needs two seconds to parse a megabyte of
- * decoder must not be pushed onto the main thread for being slow.
+ * Generous on purpose. It is paid once per document, and only in full by a
+ * platform that is already broken; a machine that needs two seconds to parse a
+ * megabyte of decoder must not be pushed onto the main thread for being slow.
  */
 const HANDSHAKE_MS = 5_000;
+
+/** How long an `import()` of the worker module gets before it is written off. */
+const MODULE_LOAD_MS = 15_000;
+
+/**
+ * How long pdf.js gets to shut a document down cleanly.
+ *
+ * `WorkerTransport.destroy` sends `Terminate` and waits for the worker to
+ * acknowledge it, with no deadline of its own — so a worker that has stopped
+ * answering would hang the tile being *closed* just as thoroughly as the one
+ * being opened. Past this we stop waiting and terminate it ourselves.
+ */
+const SHUTDOWN_MS = 5_000;
 
 let workerUrl: string | null = null;
 let mode: PdfWorkerMode | null = null;
 let preparation: Promise<PdfWorkerMode> | null = null;
+/** The worker {@link prepare} proved, held for the first document to use. */
+let proven: Worker | null = null;
+
+/** What {@link withDeadline} resolves to when the work outran its deadline. */
+const DEADLINE = Symbol("deadline");
+
+/**
+ * `work`, or {@link DEADLINE} if it takes longer than `ms`.
+ *
+ * Rejections are the caller's to handle; only the *silence* is converted, which
+ * is the failure mode this module exists to convert.
+ */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | typeof DEADLINE> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    work,
+    new Promise<typeof DEADLINE>((resolve) => {
+      timer = setTimeout(() => resolve(DEADLINE), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function describe(thrown: unknown): string {
+  return thrown instanceof Error ? thrown.message : String(thrown);
+}
 
 /**
  * The worker's source as a blob URL, made once and never revoked.
  *
- * Never revoked because pdf.js starts a *new* worker from this URL for every
- * document opened (see {@link loadPdfDocument}); revoking it after the first
- * would break the second.
+ * Never revoked because a new worker is started from it for every document
+ * opened (see {@link loadPdfDocument}); revoking it after the first would break
+ * the second.
  */
 function workerSourceUrl(): string {
   workerUrl ??= URL.createObjectURL(new Blob([pdfWorkerSource], { type: "text/javascript" }));
@@ -133,7 +206,7 @@ function workerSourceUrl(): string {
 }
 
 /**
- * Starts one worker and waits for it to speak.
+ * Starts a worker and hands it back once it has spoken. `null` if it never did.
  *
  * The worker announces itself — `WorkerMessageHandler` sends `ready` from its
  * own static initializer the moment the module evaluates — so *any* message is
@@ -142,16 +215,22 @@ function workerSourceUrl(): string {
  * platform and no capability is sniffed, which is AGENTS.md's rule for exactly
  * this kind of question.
  *
- * Resolves `false` rather than rejecting: the caller's next move is the same
+ * This is the same wait pdf.js would do anyway — it will not send `test` until
+ * `ready` arrives — so doing it here costs nothing and buys the deadline pdf.js
+ * does not have. Consuming that first message is safe: pdf.js's own `ready`
+ * handler is a no-op, and the port path it takes resolves without waiting for
+ * one.
+ *
+ * Resolves `null` rather than rejecting: the caller's next move is the same
  * whether the worker refused, crashed, or silently never arrived.
  */
-function workerAnswers(url: string): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+function startWorker(): Promise<Worker | null> {
+  return new Promise<Worker | null>((resolve) => {
     let worker: Worker;
     try {
-      worker = new Worker(url, { type: "module" });
+      worker = new Worker(workerSourceUrl(), { type: "module" });
     } catch {
-      resolve(false);
+      resolve(null);
       return;
     }
 
@@ -160,9 +239,12 @@ function workerAnswers(url: string): Promise<boolean> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      // The probe is a probe. The documents get their own workers.
+      if (answered) {
+        resolve(worker);
+        return;
+      }
       worker.terminate();
-      resolve(answered);
+      resolve(null);
     };
 
     // The line that turns the macOS hang into a decision. Everything else here
@@ -171,26 +253,6 @@ function workerAnswers(url: string): Promise<boolean> {
     worker.addEventListener("message", () => settle(true), { once: true });
     worker.addEventListener("error", () => settle(false), { once: true });
   });
-}
-
-/**
- * Stops pdf.js wrapping our worker URL in a blob that imports it.
- *
- * `_isSameOrigin` exists to decide whether `workerSrc` is a CDN URL that needs
- * the wrapper. Ours never is — it is a blob holding the source itself — so the
- * answer is always yes, and on a `tauri://` origin the honest answer is
- * unavailable anyway (the base has no origin to compare against).
- *
- * Reached through a cast because it is not on the published type. If a future
- * pdf.js drops it the assignment simply stops happening, and the fallback is
- * benign: the wrapper would then import a blob from a blob, which involves no
- * custom scheme and no scheme handler.
- */
-function stopWrappingTheWorkerUrl(): void {
-  const worker = pdfjs.PDFWorker as unknown as {
-    _isSameOrigin?: (base: unknown, other: unknown) => boolean;
-  };
-  if (typeof worker._isSameOrigin === "function") worker._isSameOrigin = () => true;
 }
 
 /** Whether the worker's message handler is already on this thread. */
@@ -210,50 +272,71 @@ function handlerIsOnThisThread(): boolean {
  *
  * Two specifiers, because this is the last line of defence: the blob (no
  * network, no scheme handler) and then the emitted asset (the same mechanism
- * every other chunk of this app already loads through). If both fail there is
- * no way to open a PDF at all, and saying so beats a spinner.
+ * every other chunk of this app already loads through). Each gets a deadline,
+ * because the second one is a request on the app's own scheme and that is the
+ * request this whole file is about. If both fail there is no way to open a PDF
+ * at all, and saying so beats a spinner.
  */
 async function runWorkerOnThisThread(): Promise<void> {
   if (handlerIsOnThisThread()) return;
 
-  let failure: unknown;
-  for (const specifier of [workerSourceUrl(), pdfWorkerUrl]) {
+  const failures: string[] = [];
+  const specifiers = [
+    { name: "the inlined worker source", specifier: workerSourceUrl() },
+    { name: "the emitted worker asset", specifier: pdfWorkerUrl },
+  ];
+
+  for (const { name, specifier } of specifiers) {
     try {
-      await import(/* @vite-ignore */ specifier);
-      if (handlerIsOnThisThread()) return;
+      const outcome = await withDeadline(import(/* @vite-ignore */ specifier), MODULE_LOAD_MS);
+      if (outcome === DEADLINE) {
+        failures.push(`${name} did not load within ${MODULE_LOAD_MS}ms`);
+        continue;
+      }
     } catch (thrown) {
-      failure = thrown;
+      failures.push(`${name}: ${describe(thrown)}`);
+      continue;
     }
+    if (handlerIsOnThisThread()) return;
+    failures.push(`${name} loaded but published no message handler`);
   }
 
-  throw new Error(
-    `the PDF decoder could not be started: ${
-      failure instanceof Error ? failure.message : String(failure)
-    }`,
-  );
+  // An import that outran its deadline may still have landed while the other
+  // one was being tried.
+  if (handlerIsOnThisThread()) return;
+
+  throw new Error(`the PDF decoder could not be started: ${failures.join("; ")}`);
+}
+
+/** Switches the session to the main thread for good, and says why. */
+async function fallBackToThisThread(why: string): Promise<void> {
+  // Worth a line in the console: it is the difference between "this app is
+  // sluggish on large PDFs" and "this app is sluggish on large PDFs *here*".
+  console.warn(`[pdf] ${why}; pdf.js will run on the main thread`);
+  await runWorkerOnThisThread();
+  mode = "main-thread";
+  preparation = Promise.resolve(mode);
 }
 
 async function prepare(): Promise<PdfWorkerMode> {
-  const url = workerSourceUrl();
+  // Set whatever happens. pdf.js reads `workerSrc` on paths that never spawn a
+  // worker, and an unset one throws from a getter rather than doing nothing.
+  // The blob is the right value even in main-thread mode: should anything ever
+  // reach `getDocument` without going through `loadPdfDocument`, the worker it
+  // builds for itself is still one that needs no scheme handler.
+  pdfjs.GlobalWorkerOptions.workerSrc = workerSourceUrl();
 
-  if (await workerAnswers(url)) {
-    stopWrappingTheWorkerUrl();
-    pdfjs.GlobalWorkerOptions.workerSrc = url;
+  const worker = await startWorker();
+  if (worker) {
+    // Kept rather than terminated: this one has already parsed a megabyte of
+    // decoder, and the first document is about to want exactly that.
+    proven = worker;
     mode = "worker";
     return mode;
   }
 
-  // Worth a line in the console: it is the difference between "this app is
-  // sluggish on large PDFs" and "this app is sluggish on large PDFs *here*".
-  console.warn(
-    "[pdf] the decoder worker did not start; pdf.js will run on the main thread",
-  );
-  await runWorkerOnThisThread();
-  // Set anyway. pdf.js reads `workerSrc` on paths that never spawn a worker,
-  // and an unset one throws from a getter rather than doing nothing.
-  pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-  mode = "main-thread";
-  return mode;
+  await fallBackToThisThread("the decoder worker did not start");
+  return "main-thread";
 }
 
 /**
@@ -275,19 +358,69 @@ export function pdfWorkerMode(): PdfWorkerMode | "unresolved" {
 }
 
 /**
+ * Ties `worker`'s lifetime to `task`'s.
+ *
+ * A `PDFWorker` built from a port does not own the worker behind it — pdf.js
+ * only terminates workers it constructed itself — so the one thing this module
+ * gains by constructing its own is the one thing it now has to clean up. Both
+ * ways out are covered: `destroy()`, which is what a closing tile calls
+ * (`PDFDocumentProxy.destroy` forwards to the loading task's), and a load that
+ * rejected and will never be destroyed because it never produced a document.
+ */
+function releaseWith(task: PdfLoadingTask, worker: Worker): PdfLoadingTask {
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    worker.terminate();
+  };
+
+  const destroy = task.destroy.bind(task);
+  task.destroy = async (): Promise<void> => {
+    try {
+      await withDeadline(destroy(), SHUTDOWN_MS);
+    } finally {
+      release();
+    }
+  };
+
+  // Not `finally`: a resolved task is a live document, and its worker has to
+  // outlive this promise by however long the tile stays open. A rejected one
+  // is the single exit nothing else covers — there is no document to close, so
+  // no tile will ever call `destroy()` for it.
+  task.promise.catch(() => void task.destroy().catch(() => {}));
+
+  return task;
+}
+
+/**
  * Opens a document. The only route to `getDocument` in this plugin.
  *
- * A funnel rather than a convenience: {@link preparePdfWorker} has to have
- * settled before pdf.js constructs anything, and a second call site that
- * reached for `pdfjs.getDocument` directly would be a second place where the
- * macOS hang could come back. Hands back the loading task rather than its
- * promise, because callers cancel and destroy through the task.
+ * A funnel rather than a convenience: the worker has to be started and
+ * *measured* before pdf.js builds anything (see "pdf.js is never given a URL to
+ * resolve"), and a second call site that reached for `pdfjs.getDocument`
+ * directly would be a second place where the macOS hang could come back. Hands
+ * back the loading task rather than its promise, because callers cancel and
+ * destroy through the task.
  */
-export async function loadPdfDocument(
-  parameters: Parameters<typeof pdfjs.getDocument>[0],
-): Promise<PdfLoadingTask> {
-  await preparePdfWorker();
-  return pdfjs.getDocument(parameters);
+export async function loadPdfDocument(parameters: PdfSource): Promise<PdfLoadingTask> {
+  if ((await preparePdfWorker()) === "main-thread") return pdfjs.getDocument(parameters);
+
+  const worker = proven ?? (await startWorker());
+  proven = null;
+
+  if (!worker) {
+    // A worker answered when the session started and does not now. Handing
+    // pdf.js one that has not spoken is exactly the trade this module refuses,
+    // so take the slow road, and take it for the rest of the session.
+    await fallBackToThisThread("a decoder worker stopped starting mid-session");
+    return pdfjs.getDocument(parameters);
+  }
+
+  return releaseWith(
+    pdfjs.getDocument({ ...parameters, worker: pdfjs.PDFWorker.create({ port: worker }) }),
+    worker,
+  );
 }
 
 /**
@@ -302,4 +435,27 @@ export function isRenderCancellation(thrown: unknown): boolean {
     thrown instanceof pdfjs.RenderingCancelledException ||
     (thrown instanceof Error && thrown.name === "RenderingCancelledException")
   );
+}
+
+/**
+ * `work`, or a rejection naming the deadline it outran.
+ *
+ * Exported because opening a document is more than starting a worker, and the
+ * steps after it — `getDocument().promise`, the first `getPage` — are pdf.js
+ * waiting on the same worker with the same absence of a timeout. `mount.ts` is
+ * the caller; see the rule in "pdf.js is never given a URL to resolve".
+ */
+export async function withinDeadline<T>(
+  work: Promise<T>,
+  ms: number,
+  what: string,
+): Promise<T> {
+  const outcome = await withDeadline(work, ms);
+  if (outcome === DEADLINE) {
+    throw new Error(
+      `${what} did not finish within ${Math.round(ms / 1000)}s (pdf.js is running ` +
+        `${pdfWorkerMode() === "worker" ? "in a worker" : "on the main thread"})`,
+    );
+  }
+  return outcome;
 }
