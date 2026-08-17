@@ -3,7 +3,7 @@
  *
  * Most of what matters about a video player is "watch it and see whether it is
  * right", which no automated check replaces — whether a scrub feels responsive,
- * whether captions land on the frame they belong to, whether J and L behave the
+ * whether captions land on the frame they belong to, whether J and K behave the
  * way a hand trained on a deck expects. What *is* checkable, and what this
  * covers, is everything underneath that judgement:
  *
@@ -627,14 +627,29 @@ function transportChecks(): SelfTestCheck[] {
     pressed.push(transport.shuttleRate);
     checks.push(
       check(
-        "L toggles forward rather than climbing a ladder",
+        "K toggles forward rather than climbing a ladder",
         pressed[0] === 1 && pressed[1] === 0 && pressed[2] === 1,
         `rates after three presses: ${pressed.join(", ")}`,
       ),
     );
 
+    // The half of "toggles" that is not the flag. `K` absorbed `L`'s job when
+    // `L` was removed, so the second press is now the only way that key stops a
+    // forward shuttle — and it used to clear `shuttleRate` while leaving the
+    // element playing, which is a stop key that does not stop.
+    transport.shuttle(1);
+    const stoppedElement = element.paused;
+    checks.push(
+      check(
+        "K pressed twice pauses the element, not just the flag",
+        transport.shuttleRate === 0 && stoppedElement,
+        `rate ${transport.shuttleRate}, element ${stoppedElement ? "paused" : "playing"}`,
+      ),
+    );
+
     // One press turns round. The old ladder took four to get from forward to
     // reverse, which for a single-rate transport would be three too many.
+    transport.shuttle(1);
     transport.shuttle(-1);
     checks.push(
       check(
@@ -653,10 +668,19 @@ function transportChecks(): SelfTestCheck[] {
       ),
     );
 
+    // Stopping no longer has a key of its own — `L` was removed and `K` took
+    // its job, so stopping is the second press of whichever direction key
+    // started it, or `Space`. `pause()` is that last route, and it has to leave
+    // a *reverse* shuttle at rest too: reverse is a stepper, not playback, so
+    // pausing an element that is already paused has to reach the flag as well.
     transport.shuttle(-1);
-    transport.stopShuttle();
+    transport.pause();
     checks.push(
-      check("K stops the shuttle", transport.shuttleRate === 0, `rate is ${transport.shuttleRate}`),
+      check(
+        "stopping the shuttle leaves it at rest",
+        transport.shuttleRate === 0 && element.paused,
+        `rate ${transport.shuttleRate}, element ${element.paused ? "paused" : "playing"}`,
+      ),
     );
 
     // The chip's ladder, including the two ways off it: from a speed below 1×
@@ -689,7 +713,7 @@ function transportChecks(): SelfTestCheck[] {
     transport.setSpeed(2);
     transport.shuttle(-1);
     const reversingRate = transport.signedRate;
-    transport.stopShuttle();
+    transport.pause();
     const stoppedRate = transport.signedRate;
     transport.setSpeed(1);
     checks.push(
@@ -699,6 +723,86 @@ function transportChecks(): SelfTestCheck[] {
         `reversing at 2×: ${reversingRate}; stopped: ${stoppedRate}`,
       ),
     );
+
+    // -----------------------------------------------------------------------
+    // What the *element* is running at
+    //
+    // Everything above asks the transport what it thinks; these ask the video.
+    // The three of them are the difference between a speed control that works
+    // and one that only updates a readout, which is what "the macOS build does
+    // not speed the video up" turned out to be.
+    // -----------------------------------------------------------------------
+
+    // The speed control used to be applied only at rest, so `x` during a
+    // forward shuttle — the state someone reaching for it is most likely to be
+    // in — moved the readout and nothing else.
+    transport.shuttle(1);
+    transport.setSpeed(1.5);
+    const duringShuttle = element.playbackRate;
+    transport.pause();
+    checks.push(
+      check(
+        "changing the speed during a forward shuttle reaches the element",
+        Math.abs(duringShuttle - 1.5) < 0.001,
+        `element rate ${duringShuttle}`,
+      ),
+    );
+
+    transport.setSpeed(2);
+    const fast = { rate: element.playbackRate, fallback: element.defaultPlaybackRate, pitch: element.preservesPitch };
+    transport.setSpeed(1);
+    const normal = { fallback: element.defaultPlaybackRate, pitch: element.preservesPitch };
+    checks.push(
+      check(
+        "the rate is written to defaultPlaybackRate as well",
+        fast.rate === 2 && fast.fallback === 2 && normal.fallback === 1,
+        `at 2×: rate ${fast.rate}, default ${fast.fallback}; at 1×: default ${normal.fallback}`,
+      ),
+    );
+    checks.push(
+      check(
+        "pitch correction is on away from 1× and off at 1×",
+        fast.pitch === true && normal.pitch === false,
+        `at 2×: ${fast.pitch}; at 1×: ${normal.pitch}`,
+      ),
+    );
+
+    // An engine that resets the rate behind the app's back, which is what
+    // WKWebView does on a resume. The event is synthesised because no engine
+    // does it on demand — what is being checked is the response to it, and the
+    // response is the difference between a film that keeps its speed across a
+    // pause and one that quietly drops to 1×.
+    transport.setSpeed(2);
+    element.playbackRate = 1;
+    element.dispatchEvent(new Event("ratechange"));
+    const rateAfterDrop = element.playbackRate;
+    checks.push(
+      check(
+        "a rate the engine drops is put back",
+        Math.abs(rateAfterDrop - 2) < 0.001,
+        `element rate after the drop: ${rateAfterDrop}`,
+      ),
+    );
+
+    // ...but not forever. An engine that answers 1× to every request is
+    // refusing, not glitching, and the loop has to end somewhere the user can
+    // see rather than in an unbounded exchange of events.
+    const before = announcements.length;
+    for (let drop = 0; drop < 8; drop += 1) {
+      element.playbackRate = 1;
+      element.dispatchEvent(new Event("ratechange"));
+    }
+    const conceded = announcements.slice(before).some((message) => message.includes("will not play at"));
+    checks.push(
+      check(
+        "an engine that keeps refusing a rate is believed, and said so",
+        conceded && element.playbackRate === 1,
+        conceded
+          ? `gave up at ${element.playbackRate}× and announced it`
+          : `no announcement; element rate ${element.playbackRate}`,
+      ),
+    );
+    transport.setSpeed(1);
 
     // The loop's three-state cycle. `currentMs` is zero throughout on a source
     // that never loaded, so the second press is rejected for being no later than
@@ -764,7 +868,7 @@ function transportChecks(): SelfTestCheck[] {
   try {
     holdTransport.shuttle(-1);
     const engaged = holds[0] === true;
-    holdTransport.stopShuttle();
+    holdTransport.pause();
     checks.push(
       check(
         "reverse asks for the picture to be held, and gives it back when it stops",
@@ -1334,7 +1438,6 @@ function stubActions(overrides?: Partial<VideoActions>): VideoActions {
     seekTo: noop,
     stepFrame: noop,
     shuttle: noop,
-    stopShuttle: noop,
     cycleSpeed: noop,
     cycleLoop: noop,
     clearLoop: noop,

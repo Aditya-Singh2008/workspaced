@@ -66,6 +66,8 @@ This is a native cross-platform desktop app, not a browser-deployed web app. Tau
 - **Windows** renders through WebView2 (Chromium-based), **macOS** through WKWebView (Safari-based). Both are solid; double-check any newer Clipboard API or filesystem-adjacent web API usage (Phase 6) against WKWebView specifically. The filesystem-adjacent half of that is settled and stays settled: there is no File System Access API usage anywhere, all I/O goes through Tauri, and nothing in the app is newer than the floor below. The Clipboard half is not — see the `ClipboardItem` note two bullets down.
 
   - **The macOS floor is macOS 14.0 (Sonoma), and it is set by the same thing the Linux floor is.** pdf.js 5.5.207 needs `Promise.withResolvers`, which on macOS means a system WebKit of Safari 17.4 or newer; Safari 17.4 shipped with macOS 14.4 and reached Ventura and Monterey only as an update those machines may or may not have taken. `bundle.macOS.minimumSystemVersion` in `tauri.conf.json` is therefore pinned to `14.0` — **Tauri's default is 10.13**, which would let the app install on systems whose webview cannot run the PDF plugin and turn a floor into a broken viewer. Choosing 14.0 over 13.0 buys the guarantee at the cost of fully-updated Ventura machines; revisit it the same way the pdf.js pin is revisited, not on its own.
+  - **A bundled app has no origin, and that is not a curiosity — it is a class of bug that only exists in bundles.** `tauri_protocol_url` (in `tauri/src/manager/mod.rs`) serves the frontend from `http://tauri.localhost` on Windows and from **`tauri://localhost` on macOS *and Linux***. `tauri:` is not a special scheme in the URL Standard, so `new URL("tauri://localhost/").origin` is the string `"null"`: the app runs in an opaque origin, every same-origin check against it fails, and any library that branches on one takes its cross-origin path. In `tauri dev` the frontend is `http://localhost:1420`, a real origin, so **none of this reproduces in development** — the first time the code takes the other branch is in a bundle a user installed.
+    That is exactly how every PDF came to hang forever on "loading" in the macOS bundle. pdf.js concluded its worker was on a CDN, wrapped the worker URL in a blob that did `await import("tauri://localhost/assets/…")`, and WKWebView never drove its `WKURLSchemeHandler` for a request originating in a worker: the import never settled, the worker never sent `ready`, and pdf.js has an error path but no timeout. A promise that never settles, and nothing logged. `viewers/pdf/pdfjs.ts` sets out the fix and the reasoning; the transferable part is the rule — **anything a worker, an `import()`, a `fetch` or a CORS check has to resolve must not depend on the app's own scheme**, and anything that starts asynchronously in a bundle needs a deadline, because the platform difference will surface as a hang rather than as an error.
   - **A clipboard write needs user activation, and a synthetic event does not grant it.** Phase 06 found this the hard way while verifying in the real engine: driven by `dispatchEvent`, *every* `navigator.clipboard` call — `writeText` included — rejects with `NotAllowedError` on webkit2gtk, which reads exactly like "this platform has no clipboard". Injected through GTK as a genuine key press or mouse drag, the same code writes both text and `image/png`, and an independent X11 client reads them back. So: a clipboard feature cannot be verified from a scripted DOM harness, and a `NotAllowedError` there means nothing. `src/shell/clipboard/system.ts` reports it as a message rather than throwing, which is the only behaviour that is right in both situations.
   - The write survives an `await` between the gesture and the call (extraction and PNG encoding both happen first, and the region copy still lands), so the `ClipboardItem`-holding-a-promise pattern is not needed on webkit2gtk. Re-check it on WKWebView, which is the engine that pattern exists for. **Still open, and it is a re-check that cannot be done from Linux**: the same note above says a scripted DOM harness proves nothing about the clipboard, so the only way to answer it is on a Mac. `shell/clipboard/system.ts` states plainly what the code does — the caller awaits `getCopyable` and the writer awaits a PNG transcode before `navigator.clipboard.write` — so whoever runs it on macOS can tell at a glance what is being tested. Do not restructure toward the promise pattern speculatively: webkit2gtk is measured working as it stands.
 - **Video codec coverage still depends on the webview, because the engine that would end that dependency is not built** (see the tech stack note above). Today playback is the `<video>` element, so what opens is whatever WebView2, WKWebView or webkit2gtk demuxes and decodes — which differs per platform in ways `src/viewers/video/codecs.ts`, `mkv/index.ts` and `webm/index.ts` document per format, and which the plugin reports as a named per-file error rather than a blank tile. Once the libmpv engine lands, coverage becomes whatever the bundled FFmpeg supports, uniformly on all three platforms, and the only remaining per-platform variation is hardware-decode backend availability (VideoToolbox on macOS, D3D11VA on Windows, VAAPI on Linux) plus native-surface embedding mechanics, both covered in `04b-video-viewer-plugin.md`.
@@ -455,47 +457,67 @@ and the NSView path's status.
 2. **The `ClipboardItem`-holding-a-promise question on WKWebView.** `Mod+C` awaits
    `getCopyable` and a PNG transcode before `navigator.clipboard.write`. Measured fine
    on webkit2gtk, never tried on WebKit proper. See `shell/clipboard/system.ts`.
-3. **Printing through WKWebView's PDF renderer.** `print.ts` hands a blob URL to a
+3. **The late audio on resume is mitigated, not measured.** A macOS build reported
+   sound arriving a beat after the picture on every resume from pause, alongside a
+   speed control that did nothing. The speed half is understood and covered by
+   self-tests (`defaultPlaybackRate` is written with every rate, and a rate the engine
+   drops is put back). The audio half has two changes behind it and neither has been
+   heard on a Mac: pitch correction is now switched off at exactly 1×, so WKWebView
+   keeps no spectral time-pitch unit in the audio path to prime, and `Transport`
+   re-primes the pipeline with a sub-frame seek before a resume **on macOS only**.
+   Confirm on a Mac. If the gap is gone without the seek, delete `#primeForResume` —
+   it is a workaround and it says so.
+4. **The macOS PDF hang is fixed by inference, and confirmed only on WebKit's other
+   port.** Every PDF hung on "loading" in the macOS bundle; the cause is set out under
+   "Platform targets" and in `viewers/pdf/pdfjs.ts`, and it was derived from Tauri's
+   source, pdf.js's source and the URL Standard rather than from a Mac. What *has* been
+   measured is the replacement path — the inlined-source blob worker starts and decodes
+   in webkit2gtk, which is WebKit — and the self-test now reports which mode the library
+   ended up in. Open a PDF in a macOS **bundle** (not `tauri dev`, which cannot
+   reproduce this) and confirm the dev self-test says `worker` rather than
+   `main-thread`. If it says `main-thread` then PDFs work and the platform is being
+   carried: that is the thing to look at next, and it is now visible instead of silent.
+5. **Printing through WKWebView's PDF renderer.** `print.ts` hands a blob URL to a
    hidden frame and calls `print()`, falling back to rasterising only if that *throws*.
    A frame that loads, accepts `print()` and produces a blank sheet reports success.
    Confirm real output, and if it is blank, make the failure detectable.
-4. **HEIC and TIFF native decode.** Both plugins try the platform decoder first and fall
+6. **HEIC and TIFF native decode.** Both plugins try the platform decoder first and fall
    back; macOS is the platform expected to succeed at both. Confirm it does, so the
    fallback path is not silently carrying macOS as well.
-5. **Keybinds exercised on a second platform.** `prompts/02-tiling-shell.md` requires
+7. **Keybinds exercised on a second platform.** `prompts/02-tiling-shell.md` requires
    two of three before Phase 2 is done; only Linux has ever run them. The self-tests
    force all three platforms in *logic*, which is not the same claim.
-6. **TCC on a restored session.** Reopening a recorded path under `~/Documents`,
+8. **TCC on a restored session.** Reopening a recorded path under `~/Documents`,
    `~/Desktop` or `~/Downloads`. See the macOS prerequisites.
-7. **`minimumSystemVersion: "14.0"` is a judgement, not a measurement.** It guarantees
+9. **`minimumSystemVersion: "14.0"` is a judgement, not a measurement.** It guarantees
    the Safari 17.4 floor by OS version alone and excludes fully-updated Ventura.
    Revisit with the pdf.js pin.
 
 **Decisions still to make**
 
-8. **libmpv linking on macOS** — dynamic against Homebrew's copy, or a vendored static
-   build. Undecided; nothing implements either. Decide it while building the engine.
-9. **The Windows libmpv wrapper-library fetch mechanism** — the claim that it is fetched
-   by its own setup step predates the decision to use raw FFI instead.
-10. **`vo=gpu-next`** — `prompts/04b` says to confirm it is still mpv's recommended value
+10. **libmpv linking on macOS** — dynamic against Homebrew's copy, or a vendored static
+    build. Undecided; nothing implements either. Decide it while building the engine.
+11. **The Windows libmpv wrapper-library fetch mechanism** — the claim that it is fetched
+    by its own setup step predates the decision to use raw FFI instead.
+12. **`vo=gpu-next`** — `prompts/04b` says to confirm it is still mpv's recommended value
     at implementation time.
 
 **Work that is specified and not built**
 
-11. **The whole libmpv video engine**, including the NSView subview embedding path on
+13. **The whole libmpv video engine**, including the NSView subview embedding path on
     macOS. Not "written and unverified" — absent. The shipped engine is the superseded
     native-`<video>` one. See the tech stack note.
-12. **`prompts/04b-refactor-migration.md`** does not exist, though this file and
+14. **`prompts/04b-refactor-migration.md`** does not exist, though this file and
     `prompts/04b-video-viewer-plugin.md` both route the reader to it.
-13. **macOS signing and notarization.** Documented as a requirement, implemented
+15. **macOS signing and notarization.** Documented as a requirement, implemented
     nowhere. See the macOS prerequisites.
-14. **`scripts/build-windows.ps1`.**
-15. **The GtkGLArea path against real compositors** (GNOME/Mutter, KDE/KWin) — Linux,
+16. **`scripts/build-windows.ps1`.**
+17. **The GtkGLArea path against real compositors** (GNOME/Mutter, KDE/KWin) — Linux,
     listed here so the video engine's open items sit together.
 
 **Known and deliberately left**
 
-16. **Companion-file name matching is case-sensitive** (`annotatedCompanionOrdinal`),
+18. **Companion-file name matching is case-sensitive** (`annotatedCompanionOrdinal`),
     so on macOS's case-insensitive default a differently-cased `-annotated` copy is not
     recognised as one. The cost is a missed "open the annotated copy?" offer or a skip
     to `-annotated-2`; it is **not** a clobbering risk, because the guard against

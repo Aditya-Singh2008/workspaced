@@ -30,15 +30,23 @@
  * menu row, speed is `x` and a menu row — and each announces what it did over
  * the picture, because a control that is not on screen has to say so.
  *
- * ## Eight listed shortcuts, and what is deliberately not among them
+ * ## Seven listed shortcuts, and what is deliberately not among them
  *
- * AGENTS.md puts the right order of magnitude at six to eight. The eight are
- * Space, J/K/L, A, I, S and F, and the choices behind them:
+ * AGENTS.md puts the right order of magnitude at six to eight. The seven are
+ * Space, J/K, A, I, S and F, and the choices behind them:
  *
- *   - **J, K and L get three rows, and earn them.** They are the one idiom a
+ *   - **J and K get two rows, and earn them.** Shuttle is the one idiom a
  *     review tool is expected to have and the one nothing else in this app
- *     suggests. Someone who knows them will try them; someone who does not will
- *     find them here, which is what the modal is for.
+ *     suggests. Someone who knows it will try it; someone who does not will
+ *     find it here, which is what the modal is for.
+ *   - **Two shuttle keys, not the conventional three.** `L` is gone and `K`
+ *     took its job: each key goes its own way and stops when pressed again, so
+ *     there is no key left whose only purpose is to undo the other two. That is
+ *     the same consolidation the loop and the inspector rows below describe,
+ *     applied to the idiom people arrive with — and it costs one chip in the
+ *     reference modal rather than adding one, which AGENTS.md's rule about
+ *     aliases is the same argument for. `engine/transport.ts` sets out the
+ *     four states the two keys reach.
  *   - **One loop key, not three.** In point, out point and clear are the whole
  *     life cycle of a review loop in that order, every time — the same
  *     three-toggles-into-one-rotation consolidation AGENTS.md describes. `a`
@@ -128,8 +136,14 @@ export interface VideoActions {
   seekTo(milliseconds: number): void;
   stepFrame(direction: 1 | -1): void;
 
+  /**
+   * Go that way, or stop and hold the frame if already going that way.
+   *
+   * Two directions and two keys; there is no third action for "stop", because
+   * every state it could be reached from is one press of `j`, `k` or `Space`
+   * away from stopped. See `engine/transport.ts`, "J and K are two keys".
+   */
   shuttle(direction: 1 | -1): void;
-  stopShuttle(): void;
   cycleSpeed(): void;
 
   cycleLoop(): void;
@@ -271,17 +285,10 @@ export function videoKeybinds(actions: VideoActions): readonly ViewerKeybind[] {
       run: () => actions.shuttle(-1),
     },
     {
-      id: "shuttle.stop",
-      label: "stop and hold this frame",
-      keys: ["k"],
-      order: 21,
-      run: () => actions.stopShuttle(),
-    },
-    {
       id: "shuttle.forward",
       label: "play forwards, or stop if already going forward",
-      keys: ["l"],
-      order: 22,
+      keys: ["k"],
+      order: 21,
       run: () => actions.shuttle(1),
     },
     {
@@ -316,7 +323,7 @@ export function videoKeybinds(actions: VideoActions): readonly ViewerKeybind[] {
 
     // --- registered, not listed ---------------------------------------------
     // Every one of these is in the context menu below, so none is
-    // keyboard-only. They are hidden because eight rows already say what this
+    // keyboard-only. They are hidden because seven rows already say what this
     // plugin does and twenty would say it worse.
     {
       id: "seek.back",

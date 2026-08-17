@@ -1,7 +1,7 @@
 /**
  * The transport: everything that moves the playhead.
  *
- * Play, pause, seek, frame-step, variable speed, J/K/L shuttle and the A/B loop
+ * Play, pause, seek, frame-step, variable speed, J/K shuttle and the A/B loop
  * — the brief's first three engine requirements — over one `HTMLVideoElement`.
  * Nothing here touches the DOM beyond that element: the scrubber, the readouts
  * and the controls all *observe* this class, which is what lets a keystroke and a
@@ -15,7 +15,7 @@
  * one so the two feel familiar. The two share no code, which is the contract
  * working as intended.
  *
- * ## J, K, L are three keys, not a ladder
+ * ## J and K are two keys, not three, and not a ladder
  *
  * They used to climb: each press of `L` moved up 1×, 2×, 4×, 8×, 16×. That is
  * the tape-deck convention and it was the wrong thing to build here. Above
@@ -25,8 +25,18 @@
  * the hardest thing this file does. Speed is a separate, better control that
  * goes from 0.25× to 4× with the audio intact.
  *
- * So: `L` plays, `J` plays backwards, `K` stops. Pressing the same key again
- * stops; pressing the other reverses. There is no hidden state to climb out of.
+ * Then `L` went too, and its job moved onto `K`. What is left is symmetrical
+ * and is the whole of it: **`J` goes backwards, `K` goes forwards, and either
+ * key pressed while already going that way stops and holds the frame.** Four
+ * states, two keys, no hidden state to climb out of, and — the reason the third
+ * key was the one to drop — no key whose only job is to undo another. `K` used
+ * to mean "stop", which is reachable from every state the transport can be in
+ * by pressing whichever of the two keys got you there (and `Space`, which
+ * pauses whatever is happening).
+ *
+ * That is why {@link Transport.shuttle}'s stop *pauses*. It did not, back when
+ * a separate `K` did the pausing, and the difference was invisible while
+ * nothing pressed `L` twice.
  *
  * The speed control is what a ladder was for, and it works in *both*
  * directions: `#stepReverse` takes its travel from `elapsed × speed`, so
@@ -34,6 +44,15 @@
  * second than backwards at 1× rather than more. That is the whole of "reverse at
  * 2×" — one rate, one direction flag, and the same anti-flicker rules below
  * applying unchanged at every speed.
+ *
+ * ## The rate is written in one place, and written three times over
+ *
+ * `#applyRate` is the only place in this file that touches `playbackRate`, and
+ * it writes `defaultPlaybackRate` and `preservesPitch` alongside it. Both of
+ * those answer a report from the macOS build — a speed control that moved the
+ * readout and not the film, and sound arriving a beat after the picture on
+ * every resume — and both are explained in full at the method, including which
+ * parts of the explanation are inferred rather than measured.
  *
  * ## Reverse is emulated, and has to be
  *
@@ -99,6 +118,8 @@
  * whenever the window went behind another is worse than one that is fifty
  * milliseconds coarse. `setInterval` keeps running and costs one comparison.
  */
+
+import { isMacOS } from "../../../platform";
 
 /** Speeds the cycle visits. The brief asks for at least 0.25× to 2×. */
 export const PLAYBACK_SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 4] as const;
@@ -199,6 +220,17 @@ const now = (): number =>
  */
 const ASSUMED_FRAME_RATE = 25;
 
+/**
+ * How many times the element's rate is put back before the engine is believed.
+ *
+ * {@link Transport.#restoreRate} exists for an engine that resets the rate
+ * behind our back; an engine that *cannot* play at the asked-for rate answers
+ * the same way, and arguing with that one would be an unbounded exchange of
+ * `ratechange` events. A handful of attempts distinguishes a reset (which
+ * sticks once corrected) from a refusal (which does not).
+ */
+const MAX_RATE_RESTORES = 4;
+
 export interface TransportCallbacks {
   /** The playhead moved, or playback started or stopped. Cheap; called often. */
   onChange(): void;
@@ -229,7 +261,7 @@ export class Transport {
   #frameRateAssumed: boolean;
 
   #speed: PlaybackSpeed = 1;
-  /** `-1` reversing, `0` off, `1` playing forward under `L`. */
+  /** `-1` reversing, `0` off, `1` playing forward under `K`. */
   #shuttle: ShuttleDirection = 0;
   /** Where the reverse stepper asked the playhead to be, in milliseconds. */
   #anchorMs = 0;
@@ -252,6 +284,10 @@ export class Transport {
   /** The last frame's presentation timestamp, and when it was handed over. */
   #framePresentedMs: number | null = null;
   #framePresentedAt = 0;
+  /** How many times this speed has been put back after the engine dropped it. */
+  #rateRestores = 0;
+  /** Whether the engine has been taken at its word about refusing a rate. */
+  #rateConceded = false;
   #abort = new AbortController();
   #destroyed = false;
 
@@ -264,6 +300,12 @@ export class Transport {
     this.#callbacks = options.callbacks;
     this.#frameRate = options.frameRate && options.frameRate > 0 ? options.frameRate : ASSUMED_FRAME_RATE;
     this.#frameRateAssumed = !(options.frameRate && options.frameRate > 0);
+
+    // The element arrives from `createVideoSurface` with nothing said about its
+    // rate; this is where the invariant starts, so `preservesPitch` and
+    // `defaultPlaybackRate` agree with the speed from the first frame rather
+    // than from the first time someone changes it.
+    this.#applyRate(this.#speed);
 
     const signal = this.#abort.signal;
     for (const event of ["play", "pause", "timeupdate", "durationchange", "ratechange", "volumechange", "seeked", "ended"]) {
@@ -280,8 +322,103 @@ export class Transport {
 
   #onMediaEvent = (): void => {
     if (this.#destroyed) return;
+    this.#restoreRate();
     this.#callbacks.onChange();
   };
+
+  // -------------------------------------------------------------------------
+  // Rate
+  // -------------------------------------------------------------------------
+
+  /**
+   * The one place the element's rate is written.
+   *
+   * Three properties rather than one, and each of the other two answers a
+   * report from the macOS build rather than being there for symmetry:
+   *
+   *   - **`defaultPlaybackRate`, and before `playbackRate`.** The specification
+   *     lets a user agent restart playback at the *default* rate whenever it
+   *     decides playback is beginning afresh — resuming, seeking, a media key,
+   *     a Now Playing control. An app that writes only `playbackRate` then gets
+   *     1× handed back without being told, which is the exact shape of the
+   *     report that "the macOS build does not speed the video up": the chip
+   *     says 2×, the rate badge says 2×, and the film runs at 1×. Writing both
+   *     makes any such reset a no-op, because the value it resets *to* is the
+   *     one we asked for. That the reset is what WKWebView is doing is inferred
+   *     from the symptom and the specification, not measured — but the cost of
+   *     writing the second property is one line either way, and `#restoreRate`
+   *     below covers the case where the engine drops the rate by some other
+   *     route.
+   *   - **`preservesPitch`, but only away from 1×.** Pitch correction is
+   *     meaningless at normal speed and it is not free: WebKit turns it into a
+   *     time-pitch unit on AVFoundation's audio path, and a time-pitch unit has
+   *     to be primed before it emits a sample. Primed on every resume, that is
+   *     the shape of the second report from the macOS build — sound arriving a
+   *     beat after the picture. At exactly 1× there is no pitch to preserve, so
+   *     the unit comes out of the path entirely; above and below 1× it goes
+   *     back in, which is the trade `engine/view.ts` describes, since a review
+   *     tool whose 0.5× makes everyone sound like someone else is not usable
+   *     for dialogue. Turning it off at 1× is right on its own terms — this is
+   *     a correction, not only a workaround — but whether it is *the* fix for
+   *     the late audio is unconfirmed until someone runs it on a Mac. See
+   *     {@link Transport.#primeForResume}, which is the other half of that
+   *     answer, and AGENTS.md's open items.
+   *
+   * The prefixed name is written alongside the standard one for the reason
+   * `createVideoSurface` gives: some builds in the webkit2gtk range this app
+   * targets honour only that one.
+   */
+  #applyRate(rate: number): void {
+    const video = this.#video;
+    const pitched = Math.abs(rate - 1) > 0.001;
+
+    if (video.preservesPitch !== pitched) video.preservesPitch = pitched;
+    const prefixed = video as HTMLVideoElement & { webkitPreservesPitch?: boolean };
+    if (prefixed.webkitPreservesPitch !== pitched) prefixed.webkitPreservesPitch = pitched;
+
+    // Assigning an equal value fires no `ratechange`, so the comparisons are
+    // not an optimisation — they are what keeps `#restoreRate` from being
+    // re-entered by this method's own events.
+    if (video.defaultPlaybackRate !== rate) video.defaultPlaybackRate = rate;
+    if (video.playbackRate !== rate) video.playbackRate = rate;
+  }
+
+  /**
+   * Puts the rate back when the engine has dropped it, and stops when it will
+   * not be put back.
+   *
+   * Runs off every media event, which is the only way to catch a reset: it is
+   * not raised by anything this class did, so nothing here is in a position to
+   * anticipate it. Reverse is skipped because the element is paused and stepped
+   * by hand there — its rate means nothing and writing one would be noise.
+   *
+   * The concession at the end is the honest half. An engine that answers 1× to
+   * every request for 4× is not glitching, it is declining, and a player that
+   * hides that keeps a readout saying something the sound and the picture both
+   * contradict.
+   */
+  #restoreRate(): void {
+    if (this.#shuttle === -1 || this.#rateConceded) return;
+
+    const wanted: number = this.#speed;
+    if (this.#video.playbackRate === wanted) {
+      // Back where it should be — either it never moved, or the last restore
+      // took. Either way the budget is spent on the next drop, not this one.
+      this.#rateRestores = 0;
+      return;
+    }
+    // Anything other than the reset value is the engine answering with a rate
+    // of its own choosing, which is information rather than a fault.
+    if (this.#video.playbackRate !== 1) return;
+
+    this.#rateRestores += 1;
+    if (this.#rateRestores > MAX_RATE_RESTORES) {
+      this.#rateConceded = true;
+      this.#callbacks.onAnnounce(`this engine will not play at ${wanted}×`, "warn");
+      return;
+    }
+    this.#applyRate(wanted);
+  }
 
   // -------------------------------------------------------------------------
   // Position
@@ -400,6 +537,7 @@ export class Transport {
   play(): void {
     if (this.#destroyed) return;
     this.#stopShuttle();
+    this.#primeForResume();
     // `play()` returns a promise that rejects when the engine declines — an
     // autoplay policy, or a source it has given up on. Swallowing it silently
     // would leave a play button that does nothing and says nothing.
@@ -488,7 +626,16 @@ export class Transport {
 
   setSpeed(speed: PlaybackSpeed): void {
     this.#speed = speed;
-    if (this.#shuttle === 0) this.#video.playbackRate = speed;
+    // A new number is a new question for the engine: one it refused is no
+    // evidence about this one.
+    this.#rateRestores = 0;
+    this.#rateConceded = false;
+    // Applied whatever the shuttle is doing. It used to be applied only at
+    // rest, which meant `x` during a forward shuttle changed the readout and
+    // nothing else — the one state where someone is most likely to reach for
+    // it. Reverse takes its travel from `#speed` directly and pays no attention
+    // to the element's rate, so writing one there is harmless.
+    this.#applyRate(speed);
     this.#callbacks.onChange();
   }
 
@@ -521,7 +668,7 @@ export class Transport {
   // Shuttle
   // -------------------------------------------------------------------------
 
-  /** `-1` reversing, `0` off, `1` playing forward under `L`. */
+  /** `-1` reversing, `0` off, `1` playing forward under `K`. */
   get shuttleRate(): ShuttleDirection {
     return this.#shuttle;
   }
@@ -546,28 +693,59 @@ export class Transport {
   }
 
   /**
-   * `L` and `J`.
+   * `J` and `K`.
    *
    * One rate each way and no ladder — see the note at the top of this file.
-   * Pressing the key you are already going in stops; pressing the other turns
-   * round. Two keys, four states, nothing hidden.
+   * Pressing the key you are already going in stops and holds the frame;
+   * pressing the other turns round. Two keys, four states, nothing hidden.
    */
   shuttle(direction: 1 | -1): void {
     this.#applyShuttle(this.#shuttle === direction ? 0 : direction);
   }
 
-  /** `K`: stop shuttling and hold this frame. */
-  stopShuttle(): void {
-    this.#applyShuttle(0);
-    this.#video.pause();
+  /**
+   * Re-primes the media pipeline just before a resume, on the one engine that
+   * needs it.
+   *
+   * The macOS build resumes with the audio a beat behind the picture, every
+   * time, and the explanation that fits is that WKWebView brings the picture
+   * back from the frame it kept and the sound back from nothing — the video
+   * renderer still has a frame, the audio renderer is restarted from cold, and
+   * the first fraction of a second is silent. A seek re-primes both together,
+   * so resuming *through* one trades a little latency for sound that starts
+   * when the picture does.
+   *
+   * The seek is to the start of the frame that is **already on screen**. The
+   * playhead is almost always somewhere inside a frame when it stops, so this
+   * is a real position change to the engine and no change at all to the eye —
+   * the same frame is displayed before and after. It goes through
+   * {@link seekTo} rather than writing `currentTime` directly so it raises the
+   * frame hold like any other paused seek.
+   *
+   * **macOS only, and deliberately.** On webkit2gtk and WebView2 a resume
+   * already brings its audio with it, and a seek per resume there would buy a
+   * flushed pipeline and a covered frame for nothing — `engine/hold.ts` sets
+   * out what a seek on a paused element costs. This is a workaround, not a
+   * design: if a run on a Mac shows the gap has gone without it, delete it.
+   */
+  #primeForResume(): void {
+    if (!isMacOS() || !this.#video.paused || this.#destroyed) return;
+
+    const frame = 1000 / this.#frameRate;
+    const at = this.currentMs;
+    const aligned = Math.floor(at / frame) * frame;
+    // Already on a frame boundary: there is no sub-frame move to make, and a
+    // seek to where the playhead already is would be a flush for nothing.
+    if (at - aligned < 1) return;
+    this.seekTo(aligned);
   }
 
   #applyShuttle(direction: ShuttleDirection): void {
     const wasReversing = this.#shuttle === -1;
     this.#shuttle = direction;
     // Anything in flight belongs to the state being left. Left alone, a seek
-    // issued while reversing lands after the user has already pressed K and
-    // drags the playhead somewhere they did not ask for.
+    // issued while reversing lands after the user has already stopped or turned
+    // round, and drags the playhead somewhere they did not ask for.
     this.#cancelStep();
     // Leaving reverse: uncover, once there is a picture to uncover to.
     if (wasReversing && direction !== -1) this.#callbacks.onHoldFrame?.(false);
@@ -576,13 +754,14 @@ export class Transport {
       // Forward shuttle is simply playback. The engine paces its own frames and
       // keeps the audio, which is better than anything this file could do by
       // hand, and the speed control is there for anyone who wants it faster.
-      this.#video.playbackRate = this.#speed;
+      this.#applyRate(this.#speed);
+      this.#primeForResume();
       void this.#video.play().catch(() => {
         /* Reported by `play()`; a failed shuttle is not a second message. */
       });
     } else if (direction === -1) {
       this.#video.pause();
-      this.#video.playbackRate = this.#speed;
+      this.#applyRate(this.#speed);
       // Before the first seek, while the element still has a frame worth
       // keeping. Engaging after it would capture whatever the first flush left.
       this.#callbacks.onHoldFrame?.(true);
@@ -594,7 +773,15 @@ export class Transport {
       this.#anchorMs = this.currentMs;
       this.#scheduleStep(MIN_STEP_MS);
     } else {
-      this.#video.playbackRate = this.#speed;
+      // Stopping stops. This branch is reached by pressing the direction key
+      // you are already going in, and since `L` was folded into `K` that is the
+      // *only* way `K` stops a forward shuttle — leaving the element playing
+      // here would make the key a no-op with a readout that claimed otherwise.
+      // (`#stopShuttle` below is the other half of the same state change and
+      // deliberately does not pause: `play()` goes through it on its way to
+      // starting.)
+      this.#video.pause();
+      this.#applyRate(this.#speed);
     }
 
     this.#syncTicker();
@@ -607,7 +794,7 @@ export class Transport {
     this.#shuttle = 0;
     this.#cancelStep();
     if (wasReversing) this.#callbacks.onHoldFrame?.(false);
-    this.#video.playbackRate = this.#speed;
+    this.#applyRate(this.#speed);
     this.#syncTicker();
   }
 

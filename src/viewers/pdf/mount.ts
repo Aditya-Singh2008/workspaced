@@ -14,7 +14,7 @@ import {
   type ViewerMountOptions,
 } from "../contract";
 import { MIN_TEXT_CHARS, PdfViewerInstance, TEXT_PROBE_PAGES } from "./instance";
-import { pdfjs, type PdfDocument } from "./pdfjs";
+import { loadPdfDocument, pdfjs, type PdfDocument, type PdfLoadingTask } from "./pdfjs";
 
 import "./pdf.css";
 
@@ -125,7 +125,29 @@ export async function mountPdf(
   // pdf.js transfers the buffer to its worker, which detaches it — and the
   // `FileHandle` memoizes those bytes for the thumbnail and search paths. So it
   // gets a copy, and the handle's array stays usable.
-  const task = pdfjs.getDocument({ data: new Uint8Array(bytes) });
+  //
+  // `loadPdfDocument` rather than `getDocument`: the worker has to be started
+  // and *measured* before the library builds anything (see `pdfjs.ts`, "The
+  // worker is started from source"). It is awaited once per session; every
+  // later open resolves immediately.
+  let task: PdfLoadingTask;
+  try {
+    task = await loadPdfDocument({ data: new Uint8Array(bytes) });
+  } catch (thrown) {
+    // Reaching here means pdf.js could not be started at all, in a worker or on
+    // this thread — which is about the installation, not about this file.
+    throw new ViewerLoadError({
+      code: "internal",
+      message: `${file.name} could not be opened.`,
+      detail: thrown instanceof Error ? thrown.message : String(thrown),
+      recoverable: true,
+      cause: thrown,
+    });
+  }
+  // Registered before the abort is re-checked, and the check is deliberately
+  // left to the one after `task.promise` below: a signal that aborted while the
+  // worker was starting never fires this listener, so throwing here would leak
+  // the task it was meant to destroy.
   options?.signal?.addEventListener("abort", () => void task.destroy(), { once: true });
 
   let document_: PdfDocument;

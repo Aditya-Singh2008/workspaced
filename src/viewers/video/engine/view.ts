@@ -216,12 +216,19 @@ export function createVideoSurface(): HTMLVideoElement {
   video.crossOrigin = "anonymous";
   // Pitch correction at 0.5× and 2×, which is the difference between a speed
   // control someone will use to review dialogue and one that makes everyone
-  // sound like a different person. The specified default is `true`, and it is
-  // set anyway: WebKit shipped this behind a prefix for years and some builds
-  // in the webkit2gtk range this app targets still honour only the prefixed
-  // name. Writing both is two lines and removes the question.
-  video.preservesPitch = true;
-  (video as unknown as { webkitPreservesPitch?: boolean }).webkitPreservesPitch = true;
+  // sound like a different person. Both the standard and the prefixed name are
+  // written, because WebKit shipped this behind a prefix for years and some
+  // builds in the webkit2gtk range this app targets still honour only the
+  // prefixed one.
+  //
+  // Started at `false` and owned from here on by `Transport.#applyRate`, which
+  // turns it on the moment the speed leaves 1× and off again when it returns.
+  // Leaving it on at 1× is not free on WKWebView — it keeps a spectral
+  // time-pitch unit in the audio path that has to be primed before it emits a
+  // sample, and that priming is heard as the sound arriving after the picture
+  // on every resume. The element starts at 1×, so it starts without it.
+  video.preservesPitch = false;
+  (video as unknown as { webkitPreservesPitch?: boolean }).webkitPreservesPitch = false;
   // Nothing here is castable — the source is a loopback URL to a local file —
   // and leaving remote playback enabled makes the engine watch for routes,
   // publish a remote-playback state and, on some builds, offer a cast button

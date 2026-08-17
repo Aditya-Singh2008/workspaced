@@ -984,10 +984,6 @@ export class VideoViewerInstance extends BaseViewerInstance implements ViewerIns
         view.wake();
         transport.shuttle(direction);
       },
-      stopShuttle: () => {
-        view.wake();
-        transport.stopShuttle();
-      },
       cycleSpeed: () => {
         view.wake();
         transport.cycleSpeed();

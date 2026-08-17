@@ -58,11 +58,43 @@ const TITLE = "pdf viewer plugin";
 
 export async function runPdfSelfTest(): Promise<SelfTestReport> {
   const checks: SelfTestCheck[] = [];
+  checks.push(await workerModeCheck());
   const environment = await probeRenderEnvironment();
   checks.push(environment.check);
   checks.push(...(await lifecycleChecks(environment.canRender)));
   checks.push(await viewportAgreementCheck());
   return report(TITLE, checks);
+}
+
+/**
+ * Whether the decoder got a real worker, and how long it took to say so.
+ *
+ * The check that would have caught the macOS bundle hanging on every PDF (see
+ * `pdfjs.ts`, "The worker is started from source"). It is not merely
+ * informational: `main-thread` means the probe timed out, which is a platform
+ * this app is now carrying rather than a platform it works on, and the number
+ * of milliseconds is what tells the two apart at a glance — a fallback taken in
+ * five seconds is the timeout, and one taken in five milliseconds is a webview
+ * that refused a blob worker outright.
+ *
+ * Deliberately the *first* check in the report: everything below it opens a
+ * document, so if this one is slow the rest are about to be slower.
+ */
+async function workerModeCheck(): Promise<SelfTestCheck> {
+  const { preparePdfWorker, PDFJS_VERSION } = await import("./pdfjs");
+  const startedAt = performance.now();
+  let mode: string;
+  try {
+    mode = await preparePdfWorker();
+  } catch (thrown) {
+    mode = thrown instanceof Error ? `unavailable — ${thrown.message}` : "unavailable";
+  }
+  const elapsed = Math.round(performance.now() - startedAt);
+  return check(
+    "pdf.js decodes in a worker",
+    mode === "worker",
+    `pdf.js ${PDFJS_VERSION}, ${mode}, resolved in ${elapsed}ms`,
+  );
 }
 
 /** Why the render-dependent checks were skipped, when they were. */
@@ -96,8 +128,8 @@ async function probeRenderEnvironment(): Promise<{
   readonly check: SelfTestCheck;
   readonly canRender: boolean;
 }> {
-  const { pdfjs } = await import("./pdfjs");
-  const task = pdfjs.getDocument({ data: buildFixturePdf() });
+  const { loadPdfDocument } = await import("./pdfjs");
+  const task = await loadPdfDocument({ data: buildFixturePdf() });
   const document_ = await task.promise;
 
   const host = document.createElement("div");
@@ -575,8 +607,8 @@ async function annotationChecks(
       15000,
       "annotation export",
     );
-    const { pdfjs } = await import("./pdfjs");
-    const reopened = await pdfjs.getDocument({ data: new Uint8Array(exported.bytes) })
+    const { loadPdfDocument } = await import("./pdfjs");
+    const reopened = await (await loadPdfDocument({ data: new Uint8Array(exported.bytes) }))
       .promise;
     const page = await reopened.getPage(2);
     const parsed = (await page.getAnnotations()) as { subtype?: string }[];
@@ -888,8 +920,8 @@ async function textAnnotationChecks(
       15000,
       "annotated export",
     );
-    const { pdfjs } = await import("./pdfjs");
-    const reopened = await pdfjs.getDocument({ data: new Uint8Array(exported.bytes) })
+    const { loadPdfDocument } = await import("./pdfjs");
+    const reopened = await (await loadPdfDocument({ data: new Uint8Array(exported.bytes) }))
       .promise;
     const page = await reopened.getPage(FIXTURE_OCR_PAGE);
     exportedSubtypes = ((await page.getAnnotations()) as { subtype?: string }[]).map(
@@ -933,7 +965,7 @@ async function textAnnotationChecks(
  */
 async function viewportAgreementCheck(): Promise<SelfTestCheck> {
   try {
-    const [{ PDFDocument, degrees }, { pdfjs }] = await Promise.all([
+    const [{ PDFDocument, degrees }, { loadPdfDocument }] = await Promise.all([
       import("pdf-lib"),
       import("./pdfjs"),
     ]);
@@ -946,7 +978,7 @@ async function viewportAgreementCheck(): Promise<SelfTestCheck> {
     }
     const bytes = await built.save({ useObjectStreams: false });
 
-    const document_ = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
+    const document_ = await (await loadPdfDocument({ data: new Uint8Array(bytes) })).promise;
     const samples = [
       { x: 0, y: 0 },
       { x: 1, y: 0 },
