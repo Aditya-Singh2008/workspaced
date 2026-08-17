@@ -168,7 +168,12 @@ export class PdfViewerInstance extends BaseViewerInstance implements ViewerInsta
               devLog(`pdf: page ${pageNumber} failed to render — ${detail}`),
             );
           }
-          this.#view.announce(`page ${pageNumber} could not be rendered`, "warn");
+          // The reason goes in the strip, not just the console. "page 3 could
+          // not be rendered" is the same sentence whether the webview stopped
+          // painting, the decoder never sent the page, or the file is damaged —
+          // and the console and `devLog` that used to carry the difference are
+          // both unreachable in a release build, which is where these are seen.
+          this.#view.announce(`page ${pageNumber} could not be rendered — ${detail}`, "warn");
         },
         // Fires during the view's own construction, before `#annotator` is
         // assigned — hence the optional call rather than an assertion.

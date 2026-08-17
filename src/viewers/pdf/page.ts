@@ -25,7 +25,13 @@
  * `view.ts`).
  */
 
-import { isRenderCancellation, pdfjs, type PdfDocument, type PdfPage } from "./pdfjs";
+import {
+  isRenderCancellation,
+  pdfjs,
+  withinDeadline,
+  type PdfDocument,
+  type PdfPage,
+} from "./pdfjs";
 
 /**
  * The ceiling on rendered pixels per CSS pixel. A 3x display already renders
@@ -43,6 +49,54 @@ const MAX_RENDER_RATIO = 3;
  * fails to allocate renders nothing at all. The ratio gives way instead.
  */
 const MAX_CANVAS_PIXELS = 2 ** 24;
+
+/**
+ * How long one page gets to draw before the strip says so.
+ *
+ * Generous — a dense page on the main thread is genuinely slow — but finite,
+ * because the failure this plugin keeps meeting on unfamiliar webviews is a
+ * render that neither finishes nor fails. AGENTS.md's rule again: a hang
+ * reports nothing and is strictly worse than a failure.
+ */
+const RENDER_MS = 30_000;
+
+/** The square the ink probe shrinks a page into. See {@link hasInk}. */
+const INK_PROBE = 32;
+
+/**
+ * Whether anything at all was drawn onto `canvas`.
+ *
+ * Worth asking because a canvas that comes back *empty* is a real WebKit
+ * failure mode and a completely silent one: `render()` resolves, the page
+ * reports success, and the tile shows paper. `selftest.ts` ("Where pdf.js is
+ * allowed to draw") checks the same property in the lab; this is that check in
+ * production, where it is the only witness there is.
+ *
+ * Shrunk into a 32-pixel square first, so the cost is one `drawImage` and one
+ * tiny `getImageData` rather than reading thirty megabytes back per page.
+ * Averaging is fine for the question being asked: a page with one line of text
+ * is no longer uniformly white once it is that small.
+ *
+ * Answers `true` when it cannot tell. A wrong "nothing was drawn" would put an
+ * error on a page that rendered correctly, which is worse than missing one.
+ */
+function hasInk(canvas: HTMLCanvasElement): boolean {
+  try {
+    const probe = document.createElement("canvas");
+    probe.width = INK_PROBE;
+    probe.height = INK_PROBE;
+    const context = probe.getContext("2d", { willReadFrequently: true });
+    if (!context) return true;
+    context.drawImage(canvas, 0, 0, INK_PROBE, INK_PROBE);
+    const { data } = context.getImageData(0, 0, INK_PROBE, INK_PROBE);
+    for (let at = 0; at < data.length; at += 4) {
+      if (data[at]! < 250 || data[at + 1]! < 250 || data[at + 2]! < 250) return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 /**
  * Rendered pixels per CSS pixel for a page of this size.
@@ -81,6 +135,15 @@ export class PdfPageView {
 
   /** Whether the canvas holds pixels for the current scale. */
   rendered = false;
+
+  /**
+   * Whether the last completed render put anything on the canvas.
+   *
+   * `true` until proven otherwise, including when it could not be measured. The
+   * view watches this across pages: one blank page is a blank page, and every
+   * page blank is a webview that is not drawing.
+   */
+  paintedInk = true;
 
   /** The scale the canvas was rendered at, so a stale page can be spotted. */
   #renderedScale = 0;
@@ -236,7 +299,22 @@ export class PdfPageView {
     const pixelWidth = Math.max(1, Math.round(box.width * ratio));
     const pixelHeight = Math.max(1, Math.round(box.height * ratio));
 
-    const context = this.canvas.getContext("2d", { alpha: false });
+    // `willReadFrequently` is pdf.js's choice, not ours, and getting it here is
+    // the only way it survives. `InternalRenderTask` ignores the context it is
+    // handed whenever a `canvas` is also passed — which it always is, because
+    // `render()` defaults `canvas` to `canvasContext.canvas` — and asks the
+    // canvas for `{ alpha: false, willReadFrequently: !enableHWA }` itself.
+    // `getContext` returns whichever context was created *first*, so creating
+    // one here without the hint silently overrode that and left every page on an
+    // accelerated backing store. `selftest.ts` ("Where pdf.js is allowed to
+    // draw") already records what an accelerated backing store does on WebKit
+    // when the window is not being composited: the render never completes, and
+    // the tile shows paper. Matching pdf.js's request means the two agree and
+    // the canvas is the software one it expects to read back from.
+    const context = this.canvas.getContext("2d", {
+      alpha: false,
+      willReadFrequently: true,
+    });
     if (!context) {
       this.#renderTask = null;
       return;
@@ -263,21 +341,63 @@ export class PdfPageView {
     });
     this.#renderTask = task;
 
+    // Two things are watched while the render runs, because the way this fails
+    // on an unfamiliar webview is silence rather than an exception.
+    //
+    // `onContinue` is handed pdf.js's own scheduler and calling it is exactly
+    // what pdf.js does when nothing is listening, so counting the calls changes
+    // nothing and tells us whether drawing ever started — the operator list has
+    // to arrive from the decoder before the first one.
+    //
+    // The frame probe answers the other half. pdf.js drives every continuation
+    // through `requestAnimationFrame`, so a webview that has stopped painting
+    // stops the render dead without failing it, and the canvas keeps the white
+    // fill above. That is indistinguishable from a blank page by eye, and the
+    // difference between the two is the whole diagnosis.
+    let continued = 0;
+    task.onContinue = (cont: () => void): void => {
+      continued += 1;
+      cont();
+    };
+    let framesFired = false;
+    const frame = requestAnimationFrame(() => {
+      framesFired = true;
+    });
+
     try {
-      await task.promise;
+      await withinDeadline(task.promise, RENDER_MS, () => {
+        const frames = framesFired
+          ? "animation frames are firing"
+          : "and this webview is not firing animation frames";
+        return continued === 0
+          ? `page ${this.pageNumber} never began drawing — no operator list arrived (${frames})`
+          : `page ${this.pageNumber} stopped drawing after ${continued} continuation(s) (${frames})`;
+      });
     } catch (thrown) {
+      cancelAnimationFrame(frame);
       this.#renderTask = null;
       // Cancellation is the *normal* case here — a scroll past, a zoom, a
       // closed tile — and must stay silent. Anything else is worth reporting.
-      if (isCurrent() && !isRenderCancellation(thrown)) throw thrown;
+      if (isRenderCancellation(thrown)) return;
+      // Our own deadline leaves the task running, and pdf.js keeps this canvas
+      // in its in-use set until the task ends — so a later attempt at this page
+      // would be refused outright rather than retried.
+      try {
+        task.cancel();
+      } catch {
+        // Already finished; nothing to stop.
+      }
+      if (isCurrent()) throw thrown;
       return;
     }
 
+    cancelAnimationFrame(frame);
     this.#renderTask = null;
     if (!isCurrent()) return;
 
     this.rendered = true;
     this.#renderedScale = scale;
+    this.paintedInk = hasInk(this.canvas);
   }
 
   /**

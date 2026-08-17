@@ -34,7 +34,7 @@
  */
 
 import { PdfPageView } from "./page";
-import type { PdfDocument } from "./pdfjs";
+import { pdfEnvironment, type PdfDocument } from "./pdfjs";
 import { clamp } from "./util";
 
 /** Discrete zoom stops, matching the original implementation's ladder. */
@@ -129,6 +129,12 @@ export class PdfView {
   #positions: number[] = [];
   /** Page numbers currently holding canvas pixels. What `#freeFarPages` bounds. */
   #holding = new Set<number>();
+  /** Completed renders that put nothing on the canvas. See `#noteInk`. */
+  #blankRenders = 0;
+  /** Whether any page has ever drawn a mark, which clears the suspicion. */
+  #everPainted = false;
+  /** So the "nothing is reaching the screen" line is said once, not per page. */
+  #reportedBlank = false;
   /** Page numbers wanted on screen right now, re-derived on every scroll. */
   #wanted = new Set<number>();
   #activeRenders = 0;
@@ -495,6 +501,42 @@ export class PdfView {
     this.#freeFarPages();
   }
 
+  /**
+   * Records whether a completed render drew anything, and speaks up when
+   * nothing ever does.
+   *
+   * A render that resolves and leaves the canvas empty is the one PDF failure
+   * this plugin has no other witness for: pdf.js reports success, the page
+   * reports success, and the tile shows paper — which is exactly what a blank
+   * page looks like. So the evidence has to be circumstantial and it has to be
+   * held to a bar: **two** completed renders, neither of which put a mark down,
+   * and no page anywhere in the document that ever has. One blank page is a
+   * blank page. Two, with nothing else drawn, is a webview.
+   *
+   * Two rather than three because only the pages in view are rendered, and a
+   * short document may never complete a third — which would leave the failure
+   * this exists to catch as silent as it was before. The cost of the other
+   * error is a warning line on a document that really is blank, which is
+   * non-fatal, dismissible, and worth it.
+   */
+  #noteInk(pageNumber: number, painted: boolean): void {
+    if (painted) {
+      this.#everPainted = true;
+      return;
+    }
+    this.#blankRenders += 1;
+    trace(`page ${pageNumber} rendered without putting anything on the canvas`);
+    if (this.#everPainted || this.#reportedBlank || this.#blankRenders < 2) return;
+    this.#reportedBlank = true;
+    this.#callbacks.onRenderError(
+      pageNumber,
+      new Error(
+        `this webview finished drawing ${this.#blankRenders} pages and left every ` +
+          `canvas empty — nothing is reaching the screen [${pdfEnvironment()}]`,
+      ),
+    );
+  }
+
   /** Starts renders, nearest to the viewport first, up to the concurrency cap. */
   #pump(): void {
     while (this.#activeRenders < MAX_CONCURRENT_RENDERS) {
@@ -533,6 +575,7 @@ export class PdfView {
     try {
       await page.render(this.#document, this.#scale, isCurrent);
       if (isCurrent() && page.holdsPixels) this.#holding.add(page.pageNumber);
+      if (isCurrent() && page.rendered) this.#noteInk(page.pageNumber, page.paintedInk);
       trace(
         `page ${page.pageNumber} render ${page.rendered ? "done" : "abandoned"} ` +
           `at scale ${this.#scale.toFixed(2)} (canvas ${page.canvas.width}x${page.canvas.height}, ` +

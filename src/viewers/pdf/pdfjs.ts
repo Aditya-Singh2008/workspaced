@@ -575,13 +575,15 @@ export function isRenderCancellation(thrown: unknown): boolean {
 export async function withinDeadline<T>(
   work: Promise<T>,
   ms: number,
-  what: string,
+  // A function when the description depends on what was observed while waiting,
+  // which is the interesting case: a render that stalled says *where*.
+  what: string | (() => string),
 ): Promise<T> {
   const outcome = await withDeadline(work, ms);
   if (outcome === DEADLINE) {
     throw new Error(
-      `${what} did not finish within ${Math.round(ms / 1000)}s (pdf.js is running ` +
-        `${pdfWorkerMode() === "worker" ? "in a worker" : "on the main thread"})`,
+      `${typeof what === "function" ? what() : what} did not finish within ` +
+        `${Math.round(ms / 1000)}s [${pdfEnvironment()}]`,
     );
   }
   return outcome;

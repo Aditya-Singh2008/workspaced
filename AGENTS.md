@@ -510,6 +510,26 @@ and the NSView path's status.
    release builds and two round trips were spent on screenshots that could not say
    which engine they came from. `main-thread` means PDFs work and the platform is being
    carried, which is the next thing to look at.
+4b. **Pages that render blank on macOS.** Reported after the load path was fixed: the
+   document opens, the text and annotation layers are correct, and every page canvas
+   stays white. It could not be reproduced on webkit2gtk with compositing on or off, so
+   `viewers/pdf/page.ts` was changed to stop guessing and start reporting — and to
+   correct one thing the app was doing wrong regardless. **The wrong thing:** the app
+   created the 2D context itself, before pdf.js could, so `getContext` returned that
+   one and pdf.js's own `{ alpha: false, willReadFrequently: !enableHWA }` was silently
+   discarded — leaving every page on an accelerated backing store, which is exactly
+   what the self-test's "Where pdf.js is allowed to draw" check says renders nothing on
+   WebKit when the window is not composited. It now asks for what pdf.js asks for.
+   **The reporting:** a render is deadlined at 30s and says *where* it stopped — pdf.js
+   drives continuations through `requestAnimationFrame`, so "never began drawing" (no
+   operator list) and "stopped drawing after N continuations" (frames not firing) are
+   different sentences, and each carries whether frames fired at all. Separately, a
+   render that *succeeds* and leaves the canvas empty is caught by sampling the canvas
+   into a 32-pixel square; two of those with nothing drawn anywhere says so. Both
+   messages, and the reason on every per-page failure, now reach the status strip
+   rather than only the console — see the note in `instance.ts`.
+   Confirm on a Mac: if pages are still blank the strip now names which of the three it
+   is.
 5. **Printing through WKWebView's PDF renderer.** `print.ts` hands a blob URL to a
    hidden frame and calls `print()`, falling back to rasterising only if that *throws*.
    A frame that loads, accepts `print()` and produces a blank sheet reports success.
