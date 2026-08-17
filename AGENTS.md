@@ -54,7 +54,8 @@ This is a native cross-platform desktop app, not a browser-deployed web app. Tau
 **Everything below was developed and verified on Linux.** Where a note says a thing is checked, it is checked there unless it says otherwise; what has never been run on macOS or Windows is listed under "Open items and unverified decisions" near the end of this file, and that list is the one to read before claiming any of this is settled. Keep the following in mind while implementing:
 
 - **Linux** renders through webkit2gtk, which trails Chromium and Safari on some CSS/JS features and varies by distro. Canvas-heavy rendering (PDF and image display are the core of this app) is the most likely place for inconsistencies to surface. Test on at least one Linux distro during Phase 3 and Phase 4, not only at the end.
-  - **The floor is webkit2gtk 2.44** (Safari 17.4, Chromium 119, Ubuntu 24.04 LTS), and it is a floor the app *holds up* rather than one the dependencies respect. `pdfjs-dist@5.5.207` calls `Promise.try` (WebKit shipped it in Safari 18.2) and `URL.parse` (18.0) with no guard at all, plus `Promise.withResolvers` and `AbortSignal.any` (17.4); `src/viewers/pdf/compat.ts` polyfills all four, on the main thread *and* inside the decoder worker, which is a separate global scope and needs its own copy. **This bullet said the floor was "set by `Promise.withResolvers`" and that was wrong** — it named the newest API someone had noticed, not the newest one present. Re-run the scan in `compat.ts` whenever the pdf.js pin moves, and treat anything added later that needs a newer baseline as a decision, not a detail.
+  - **The floor is webkit2gtk 2.44** (Safari 17.4, Chromium 119, Ubuntu 24.04 LTS), and it is a floor the app *holds up* rather than one the dependencies respect. `pdfjs-dist@5.5.207` calls eight built-ins newer than Safari 17.0 with no guard at all — `Promise.try`, `Uint8Array.prototype.toBase64`/`toHex` and `Uint8Array.fromBase64` (Safari 18.2), `URL.parse` (18.0), `Promise.withResolvers`, `AbortSignal.any` and `ArrayBuffer.prototype.transferToFixedLength` (17.4) — and `src/viewers/pdf/compat.ts` polyfills all of them, on the main thread *and* inside the decoder worker, which is a separate global scope and needs its own copy.
+    **This bullet claimed the floor was "set by `Promise.withResolvers`", and that claim was arrived at by reading, and it was wrong twice** — each time naming the newest API someone had noticed rather than the newest one present, and each time costing a round trip to a Mac. Reading finds candidates; it does not finish the job. **Finish it by measuring**: delete the whole post-17.0 surface from a webkit2gtk page *and* from the worker blob (intercept `Blob`) and run the self-test suite plus a real font-embedding PDF until they are green — `compat.ts` describes the rig. Do that whenever the pdf.js pin moves, and treat anything added later that needs a newer baseline as a decision, not a detail.
   - **Prefer a CSS `filter` on an element over `CanvasRenderingContext2D.filter`.** webkit2gtk *accepts* the canvas property, returns it verbatim when read back, and ignores it when drawing — so a feature probe that sets it and checks it says "supported" while every affected draw comes out untouched. The element-level filter has no such problem, is composited on the GPU, and leaves the canvas pixels alone. More generally: probe a capability by *using* it and measuring the result, never by asking whether the API exists.
   - **A `::selection` rule that sets only a background lets webkit2gtk choose the foreground**, and it chooses the GTK theme's selected-text colour — overriding `color: transparent` on the text underneath. Chromium and Firefox leave transparent text transparent, so this is invisible on two of the three engines. **Not on the third: WKWebView is WebKit too.** The rule in `pdf.css` is unconditional and is protecting macOS as well as Linux — do not narrow it on the reasoning that only webkit2gtk is affected. It surfaced in phase 05b as the PDF text layer becoming *visible* the moment it was selected: a second, offset copy of the words over the canvas's own, and on a scanned page the OCR text painted over the picture of itself. Any selection styling over invisible text has to name `color` **and** `-webkit-text-fill-color`; `src/viewers/pdf/pdf.css` does, and pdf.js's own stylesheet does not — do not "simplify" it back to theirs.
   - **webkit2gtk has no PDF renderer at all**, which WebView2 and WKWebView both do. Anything that hands a PDF to the webview and expects it to appear — a frame, an `<embed>`, a print preview — does nothing here. `src/viewers/pdf/print.ts` is the one place that matters so far, and it rasterises through pdf.js on Linux instead.
@@ -479,18 +480,36 @@ and the NSView path's status.
    `viewers/pdf/pdfjs.ts` now takes URLs out of the question entirely (worker from
    inlined source, measured before use, handed to pdf.js as `getDocument({ worker })`,
    every await deadlined) — but it did not fix the reported bug.
-   *Round two* is the real cause: **`pdfjs-dist@5.5.207` calls `Promise.try`, which
-   WebKit only shipped in Safari 18.2.** Its `MessageHandler` dispatches every request
-   that expects an answer through it, so on an older Safari the first one — the
-   document request itself — threw inside the worker's message listener, nothing
-   replied, and the load never settled. `viewers/pdf/compat.ts` polyfills it and three
-   others in both realms. Measured on webkit2gtk with those built-ins deleted from
-   the page *and* from the worker: 29/29 with the shim, and without it the tile reports
-   `TypeError: Promise.try is not a function` in about a second.
-   What is left: open a PDF in a macOS **bundle** (not `tauri dev`) and confirm the dev
-   self-test's first two lines — that nothing had to be polyfilled, or which built-ins
-   were, and that the mode is `worker` rather than `main-thread`. `main-thread` means
-   PDFs work and the platform is being carried, which is the next thing to look at.
+   *Round two* is the real cause, and it is a version gap, not a scheme problem:
+   **pdf.js 5.5.207 uses built-ins that WebKit only shipped in Safari 18.2, and
+   WKWebView runs whatever Safari the machine is on.** `MessageHandler` dispatches
+   every request that expects an answer through `Promise.try`, so the document request
+   itself threw inside the worker's message listener, nothing replied, and the load
+   never settled. Fixing that alone then exposed `Uint8Array.prototype.toHex`, which
+   builds the fingerprint pair every open waits for. `viewers/pdf/compat.ts` polyfills
+   eight built-ins in both realms, and it was finished by *measurement* rather than by
+   reading — see the floor bullet under "Platform targets". Verified on webkit2gtk with
+   the entire post-17.0 surface deleted from the page and from the worker: 29/29, and
+   two real font-embedding PDFs render **pixel-identically** to the same files on the
+   unmodified engine. With the shim defeated, the tile names the cause in about a
+   second instead of timing out.
+   *Round three* was the lesson that mattered. Two rounds of "polyfill the thing that
+   broke" is a pattern, not a fix, so the worker is no longer trusted to have the
+   globals it was sent: `compat.ts` **posts what it found from inside the worker
+   realm**, before pdf.js evaluates, and `pdfjs.ts` declines any worker that reports a
+   gap or reports nothing at all — falling back to the main thread, whose globals this
+   app patched itself and can vouch for. The main-thread path re-asserts and re-checks
+   them too, after a megabyte of third-party module has been evaluated in that realm.
+   So a built-in nobody has noticed yet costs a slower decode, not a broken viewer.
+   Measured with the shim deliberately withheld from the worker: 28/29 (only the check
+   that *asserts* worker mode fails), and a real PDF renders pixel-identically.
+   What is left: open a PDF in a macOS **bundle** (not `tauri dev`) and read the mode.
+   No dev build is needed for that any more — **every PDF load failure now carries
+   `pdfEnvironment()` in its detail**, naming the version, the thread, and the
+   built-ins each realm was missing, because the self-test panel is stripped from
+   release builds and two round trips were spent on screenshots that could not say
+   which engine they came from. `main-thread` means PDFs work and the platform is being
+   carried, which is the next thing to look at.
 5. **Printing through WKWebView's PDF renderer.** `print.ts` hands a blob URL to a
    hidden frame and calls `print()`, falling back to rasterising only if that *throws*.
    A frame that loads, accepts `print()` and produces a blank sheet reports success.

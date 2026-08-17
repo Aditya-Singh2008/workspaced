@@ -108,7 +108,13 @@
 // old webviews lack, and ES modules evaluate in declaration order, so putting
 // it above `pdfjs-dist` is what gets them in place before pdf.js's module body
 // runs. See `compat.ts` — the gap is why every PDF hung on macOS.
-import { PDF_COMPAT_SOURCE } from "./compat";
+import {
+  PDF_COMPAT_SOURCE,
+  describePdfCompat,
+  installPdfCompat,
+  pdfCompatHere,
+  type PdfCompatReport,
+} from "./compat";
 
 import * as pdfjs from "pdfjs-dist";
 
@@ -179,6 +185,8 @@ let mode: PdfWorkerMode | null = null;
 let preparation: Promise<PdfWorkerMode> | null = null;
 /** The worker {@link prepare} proved, held for the first document to use. */
 let proven: Worker | null = null;
+/** What the last worker realm reported about its own globals. */
+let workerCompat: PdfCompatReport | null = null;
 
 /** What {@link withDeadline} resolves to when the work outran its deadline. */
 const DEADLINE = Symbol("deadline");
@@ -222,23 +230,33 @@ function workerSourceUrl(): string {
 }
 
 /**
- * Starts a worker and hands it back once it has spoken. `null` if it never did.
+ * Starts a worker and hands it back once it has spoken *and* said it is fit to
+ * decode in. `null` if it never did either.
  *
- * The worker announces itself — `WorkerMessageHandler` sends `ready` from its
- * own static initializer the moment the module evaluates — so *any* message is
- * proof the whole path works: the blob was accepted, module workers are
- * available, and a megabyte of decoder parsed and ran. Nothing is asked of the
- * platform and no capability is sniffed, which is AGENTS.md's rule for exactly
- * this kind of question.
+ * Two messages arrive, in this order, and both are load-bearing:
  *
- * This is the same wait pdf.js would do anyway — it will not send `test` until
- * `ready` arrives — so doing it here costs nothing and buys the deadline pdf.js
- * does not have. Consuming that first message is safe: pdf.js's own `ready`
+ *   1. **The compat report.** `PDF_COMPAT_SOURCE` runs ahead of pdf.js in that
+ *      realm and posts what it had to supply and what is still absent. This is
+ *      the only way to know whether the *worker's* globals are the ones pdf.js
+ *      needs — the main thread's copy of the shim proves nothing about the
+ *      worker's, and assuming it did is exactly how `toHex is not a function`
+ *      became a mystery instead of a sentence. A realm that reports anything
+ *      missing is refused here, so the session falls back to the main thread,
+ *      whose globals this module patched itself and can vouch for.
+ *   2. **pdf.js's own `ready`.** `WorkerMessageHandler` sends it from a static
+ *      initializer the moment the module evaluates, so it is proof the rest of
+ *      the path works: the blob was accepted, module workers are available, and
+ *      a megabyte of decoder parsed and ran. Nothing is sniffed, which is
+ *      AGENTS.md's rule for this kind of question.
+ *
+ * That second wait is one pdf.js would do anyway — it will not send `test`
+ * until `ready` arrives — so doing it here costs nothing and buys the deadline
+ * pdf.js does not have. Consuming both messages is safe: pdf.js's own `ready`
  * handler is a no-op, and the port path it takes resolves without waiting for
  * one.
  *
  * Resolves `null` rather than rejecting: the caller's next move is the same
- * whether the worker refused, crashed, or silently never arrived.
+ * whether the worker refused, crashed, arrived unfit, or never arrived at all.
  */
 function startWorker(): Promise<Worker | null> {
   return new Promise<Worker | null>((resolve) => {
@@ -249,6 +267,11 @@ function startWorker(): Promise<Worker | null> {
       resolve(null);
       return;
     }
+
+    // Per call, not the module-level copy: that one keeps the *last* report for
+    // diagnostics, and reading it here would let a later worker inherit an
+    // earlier one's clean bill of health.
+    let reported: PdfCompatReport | null = null;
 
     let settled = false;
     const settle = (answered: boolean): void => {
@@ -266,7 +289,23 @@ function startWorker(): Promise<Worker | null> {
     // The line that turns the macOS hang into a decision. Everything else here
     // is the happy path.
     const timer = setTimeout(() => settle(false), HANDSHAKE_MS);
-    worker.addEventListener("message", () => settle(true), { once: true });
+
+    worker.addEventListener("message", (event: MessageEvent) => {
+      const report = (event.data as { __pdfCompat?: PdfCompatReport } | null)?.__pdfCompat;
+      if (report) {
+        reported = report;
+        workerCompat = report;
+        // Not an answer, and not the end of the wait: `ready` is still coming.
+        if (report.missing.length > 0) settle(false);
+        return;
+      }
+      // `ready` with no report before it means the shim did not run in that
+      // realm — the blob was assembled wrong, or something stripped it, or a
+      // reason nobody has thought of yet. Whatever it is, this thread cannot
+      // vouch for those globals and pdf.js will walk straight into them, so the
+      // worker is declined in favour of the realm this module patched itself.
+      settle(reported !== null);
+    });
     worker.addEventListener("error", () => settle(false), { once: true });
   });
 }
@@ -330,6 +369,20 @@ async function fallBackToThisThread(why: string): Promise<void> {
   // sluggish on large PDFs" and "this app is sluggish on large PDFs *here*".
   console.warn(`[pdf] ${why}; pdf.js will run on the main thread`);
   await runWorkerOnThisThread();
+
+  // The worker path checks the realm it is about to decode in; this one has to
+  // as well, and it is not free to assume — a megabyte of third-party module
+  // has just been evaluated in *this* realm. `installPdfCompat` is idempotent,
+  // so this either changes nothing or repairs something, and either way the
+  // next line is a fact rather than an assumption.
+  installPdfCompat();
+  const here = pdfCompatHere();
+  if (here.missing.length > 0) {
+    throw new Error(
+      `the PDF decoder cannot run here: this webview is missing ${here.missing.join(", ")}`,
+    );
+  }
+
   mode = "main-thread";
   preparation = Promise.resolve(mode);
 }
@@ -351,8 +404,31 @@ async function prepare(): Promise<PdfWorkerMode> {
     return mode;
   }
 
-  await fallBackToThisThread("the decoder worker did not start");
+  await fallBackToThisThread(
+    workerCompat === null
+      ? "the decoder worker started but never reported its built-ins, so its realm cannot be vouched for"
+      : workerCompat.missing.length > 0
+        ? `the decoder worker's realm is missing ${workerCompat.missing.join(", ")}`
+        : "the decoder worker did not start",
+  );
   return "main-thread";
+}
+
+/**
+ * One line describing where pdf.js is running and what its globals are, for
+ * error details and the self-test.
+ *
+ * Attached to every load failure on purpose. The dev self-test panel is
+ * stripped from release builds, which is precisely where these failures are
+ * reported from — so without this, a user's screenshot says a thing broke and
+ * nothing about the engine it broke on, and answering costs a round trip.
+ */
+export function pdfEnvironment(): string {
+  const here = `main thread: ${describePdfCompat(pdfCompatHere())}`;
+  const there = workerCompat ? `; worker: ${describePdfCompat(workerCompat)}` : "";
+  return `pdf.js ${PDFJS_VERSION} on the ${
+    mode === "main-thread" ? "main thread" : "worker"
+  } — ${here}${there}`;
 }
 
 /**

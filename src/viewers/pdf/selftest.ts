@@ -83,17 +83,17 @@ export async function runPdfSelfTest(): Promise<SelfTestReport> {
  * the plugin, is downstream of it.
  */
 async function engineBuiltInsCheck(): Promise<SelfTestCheck> {
-  const { pdfCompatFilled, pdfCompatMissing } = await import("./compat");
-  const filled = pdfCompatFilled();
-  const missing = pdfCompatMissing();
+  const [{ pdfCompatHere }, { preparePdfWorker, pdfEnvironment }] = await Promise.all([
+    import("./compat"),
+    import("./pdfjs"),
+  ]);
+  // Awaited so the worker's own report has arrived: the point of this check is
+  // the realm that decodes, not the one that asks it to.
+  await preparePdfWorker().catch(() => undefined);
   return check(
     "the webview has the built-ins pdf.js needs",
-    missing.length === 0,
-    missing.length > 0
-      ? `still missing after polyfilling: ${missing.join(", ")}`
-      : filled.length > 0
-        ? `polyfilled for this webview: ${filled.join(", ")}`
-        : "all present natively",
+    pdfCompatHere().missing.length === 0,
+    pdfEnvironment(),
   );
 }
 

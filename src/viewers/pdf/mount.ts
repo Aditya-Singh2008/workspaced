@@ -16,6 +16,7 @@ import {
 import { MIN_TEXT_CHARS, PdfViewerInstance, TEXT_PROBE_PAGES } from "./instance";
 import {
   loadPdfDocument,
+  pdfEnvironment,
   pdfjs,
   withinDeadline,
   type PdfDocument,
@@ -49,9 +50,17 @@ function looksLikePdf(bytes: Uint8Array): boolean {
   );
 }
 
-/** Turns a pdf.js load failure into the contract's vocabulary. */
+/**
+ * Turns a pdf.js load failure into the contract's vocabulary.
+ *
+ * Every detail carries {@link pdfEnvironment} with it. The dev self-test panel
+ * is stripped from release builds — which is where these failures are seen — so
+ * this line is the only thing that tells a user's screenshot apart from another
+ * user's screenshot: which engine, which mode, which built-ins were missing.
+ * Two macOS round trips were spent learning that.
+ */
 function describeLoadFailure(thrown: unknown, name: string): ViewerLoadError {
-  const detail = thrown instanceof Error ? thrown.message : String(thrown);
+  const detail = `${thrown instanceof Error ? thrown.message : String(thrown)} [${pdfEnvironment()}]`;
 
   // Matched by name: pdf.js throws `PasswordException` but does not export the
   // class from its public entry point, so `instanceof` is not available.
@@ -158,7 +167,7 @@ export async function mountPdf(
     throw new ViewerLoadError({
       code: "internal",
       message: `${file.name} could not be opened.`,
-      detail: thrown instanceof Error ? thrown.message : String(thrown),
+      detail: `${thrown instanceof Error ? thrown.message : String(thrown)} [${pdfEnvironment()}]`,
       recoverable: true,
       cause: thrown,
     });

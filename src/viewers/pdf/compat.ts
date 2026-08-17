@@ -4,58 +4,79 @@
  *
  * ## Why this file exists
  *
- * AGENTS.md records the engine floor as "`Promise.withResolvers`, i.e.
- * webkit2gtk 2.44+ / Safari 17.4+ / Chromium 119+". That was measured by
- * reading pdf.js for the *newest* API someone had noticed, and it was wrong —
- * `pdfjs-dist@5.5.207` also calls **`Promise.try`**, which WebKit shipped in
- * Safari 18.2, and **`URL.parse`**, which it shipped in Safari 18.0. On macOS
- * that is not an academic gap: WKWebView runs the *system* WebKit, and a
- * Sonoma machine that has not taken a Safari update is on 17.x.
+ * AGENTS.md recorded the engine floor as "`Promise.withResolvers`, i.e.
+ * webkit2gtk 2.44+ / Safari 17.4+ / Chromium 119+". That was arrived at by
+ * reading pdf.js for the *newest* API someone had noticed, and it was wrong:
+ * `pdfjs-dist@5.5.207` also calls `Promise.try`, `Uint8Array.prototype.toHex`
+ * and five others that WebKit shipped later. On macOS that is not academic —
+ * WKWebView runs the *system* WebKit, which moves with Safari and not with the
+ * OS version, so a Sonoma machine that has not taken a Safari update is on 17.x
+ * while every other platform in the fleet is years ahead.
  *
- * The way it failed is worth writing down, because it is the failure mode this
- * plugin keeps meeting from different directions. `MessageHandler` dispatches
- * every request that expects an answer through `Promise.try(action, data)` —
- * so on Safari 17 the *first* such request, `GetDocRequest`, threw
+ * The way it failed is the reason this plugin now distrusts its own worker.
+ * `MessageHandler` dispatches every request that expects an answer through
+ * `Promise.try`, so the first one — `GetDocRequest` — threw
  * `TypeError: Promise.try is not a function` inside the worker's `message`
- * listener. Nothing catches that: the reply is never sent, the main thread's
- * `workerIdPromise` never settles, and `getDocument().promise` waits forever.
- * The worker had already announced itself, so every diagnostic said the worker
- * was healthy. It reached a user as "PDFs are stuck on loading, and only on
- * macOS", and it survived a fix aimed at the custom-scheme worker load because
- * it has nothing to do with the scheme — a Mac on Safari 17 would hang in
- * `tauri dev` too.
+ * listener. Nothing catches that: no reply is sent, and `getDocument().promise`
+ * waits forever. Fixing it exposed the next one behind it, `toHex`, which
+ * builds the fingerprint pair every open waits for. Both reached a user as
+ * "PDFs are stuck on loading, and only on macOS".
  *
  * ## What is and is not covered
  *
- * The four below are everything `pdfjs-dist@5.5.207` reaches for above Safari
- * 17.0, which is the webview on the oldest macOS `tauri.conf.json` admits
- * (`minimumSystemVersion: "14.0"`). The scan behind that claim is worth
- * repeating whenever the pin moves, because the list is not stable between
- * pdf.js releases:
+ * Everything `pdfjs-dist@5.5.207` reaches for above Safari 17.0, which is the
+ * webview on the oldest macOS `tauri.conf.json` admits
+ * (`minimumSystemVersion: "14.0"`):
  *
- *   - `Promise.try` (Safari 18.2) and `URL.parse` (18.0) — both **unguarded**,
- *     and both on the document-open path.
- *   - `Promise.withResolvers` (17.4) and `AbortSignal.any` (17.4) — unguarded,
- *     and missing on macOS 14.0–14.3.
- *   - `Math.sumPrecise` — pdf.js ships its own polyfill for it. Left alone.
- *   - `Float16Array` and `ImageDecoder` — both behind `FeatureTest`, so pdf.js
- *     takes another path when they are absent. Left alone.
- *   - `AbortSignal.any`, `Set.prototype.intersection`, `findLast`, `at`,
- *     `replaceAll`, `structuredClone`, `FinalizationRegistry` — at or below the
- *     floor. Left alone.
+ *   - **Safari 18.2** — `Promise.try`, `Uint8Array.prototype.toBase64`,
+ *     `Uint8Array.prototype.toHex`, `Uint8Array.fromBase64`.
+ *   - **Safari 18.0** — `URL.parse`.
+ *   - **Safari 17.4** — `Promise.withResolvers`, `AbortSignal.any`,
+ *     `ArrayBuffer.prototype.transferToFixedLength`.
+ *
+ * Every one is called unguarded, and two are on the path every document takes.
+ *
+ * Left alone, deliberately: `Math.sumPrecise`, which pdf.js polyfills itself;
+ * `Float16Array` and `ImageDecoder`, which sit behind `FeatureTest` so pdf.js
+ * takes another path without them; and `Set.prototype.intersection`,
+ * `findLast`, `at`, `replaceAll`, `structuredClone` and `FinalizationRegistry`,
+ * which are at or below the floor.
+ *
+ * **This list was arrived at twice by reading and was wrong both times**, each
+ * time costing a round trip to a Mac. Reading finds candidates; it does not
+ * finish the job. The way to finish is to delete the whole post-17.0 surface
+ * from a webkit2gtk page *and* from the worker blob (intercept `Blob`; a worker
+ * is another realm) and run `selftest.ts` plus a real font-embedding PDF until
+ * both are green. Do that whenever the pdf.js pin moves.
  *
  * Polyfilling rather than raising `minimumSystemVersion` is the deliberate
- * choice: these are four small functions, and the alternative refuses to
- * install on machines whose only problem is an un-updated Safari.
+ * choice: these are small functions, and the alternative refuses to install on
+ * machines whose only problem is an un-updated Safari.
  *
- * ## The worker realm needs them too, and gets them the same way
+ * ## The worker realm needs them too, and is asked rather than assumed
  *
  * A worker is a separate global scope, so installing on the main thread does
  * nothing for the thread that actually decodes. Because `pdfjs.ts` builds the
- * worker out of inlined source, {@link PDF_COMPAT_SOURCE} can simply be put in
- * front of it — one implementation, both realms, no second copy to keep in
- * step.
+ * worker out of inlined source, {@link PDF_COMPAT_SOURCE} is put in front of it
+ * — one implementation, both realms.
+ *
+ * And then the worker is *asked*. Running there, this function posts what it
+ * found and what is still missing as the worker's first message, before pdf.js
+ * evaluates; {@link installPdfCompat} is the only thing in the app that can
+ * answer "is the decoder's realm actually fit to decode in". `pdfjs.ts` reads
+ * that report and refuses a worker that is not, which turns every future
+ * version of this bug — including one where the shim fails to arrive for a
+ * reason nobody has thought of yet — into a main-thread fallback that works,
+ * plus a sentence naming the built-in.
  */
+
+/** What {@link installPdfCompat} found, from whichever realm it ran in. */
+export interface PdfCompatReport {
+  /** Built-ins that were absent and have been supplied. */
+  readonly filled: readonly string[];
+  /** Built-ins still absent afterwards. Non-empty means pdf.js will break. */
+  readonly missing: readonly string[];
+}
 
 /**
  * Installs the missing built-ins on whichever global scope calls it.
@@ -63,88 +84,163 @@
  * **This function is stringified** (see {@link PDF_COMPAT_SOURCE}) and run
  * inside a worker that shares none of this module's scope. It must therefore
  * stay entirely self-contained: no imports, no module-level constants, no
- * helpers — a minifier renames those, and the renamed name does not exist over
- * there. Globals are fine; nothing else is.
+ * helpers defined outside its own body — a minifier renames those, and the
+ * renamed name does not exist over there. Globals are fine; nothing else is.
  *
- * Idempotent, and it records what it had to fill on `globalThis` so
- * {@link pdfCompatFilled} can report the engine rather than guess at it.
+ * Idempotent.
  */
 export function installPdfCompat(): void {
   const scope = globalThis as unknown as Record<string, unknown>;
-  const filled: string[] = [];
-
   const promises = Promise as unknown as Record<string, unknown>;
-
-  if (typeof promises["withResolvers"] !== "function") {
-    promises["withResolvers"] = function () {
-      let resolve!: (value: unknown) => void;
-      let reject!: (reason?: unknown) => void;
-      const promise = new Promise<unknown>((res, rej) => {
-        resolve = res;
-        reject = rej;
-      });
-      return { promise, resolve, reject };
-    };
-    filled.push("Promise.withResolvers");
-  }
-
-  if (typeof promises["try"] !== "function") {
-    // Rejects when `fn` throws synchronously, because the executor throwing is
-    // how a `new Promise` rejects — which is the entire point of the method.
-    promises["try"] = function (fn: (...args: unknown[]) => unknown, ...args: unknown[]) {
-      return new Promise((resolve) => {
-        resolve(fn(...args));
-      });
-    };
-    filled.push("Promise.try");
-  }
-
   const urls = URL as unknown as Record<string, unknown>;
-
-  if (typeof urls["parse"] !== "function") {
-    // `unknown` rather than `string`: pdf.js passes `window.location` as the
-    // base, and the constructor stringifies it the same way the real method
-    // does.
-    urls["parse"] = function (url: unknown, base?: unknown) {
-      try {
-        return base === undefined || base === null
-          ? new URL(url as string)
-          : new URL(url as string, base as string);
-      } catch {
-        return null;
-      }
-    };
-    filled.push("URL.parse");
-  }
-
+  const bytes = Uint8Array as unknown as Record<string, unknown>;
+  const bytesProto = Uint8Array.prototype as unknown as Record<string, unknown>;
+  const buffers = ArrayBuffer.prototype as unknown as Record<string, unknown>;
   const signals = scope["AbortSignal"] as Record<string, unknown> | undefined;
 
-  if (signals && typeof signals["any"] !== "function") {
-    signals["any"] = function (sources: Iterable<AbortSignal>) {
-      const controller = new AbortController();
-      const list = Array.from(sources);
-      for (const source of list) {
-        if (source.aborted) {
-          controller.abort(source.reason);
-          return controller.signal;
-        }
-      }
-      for (const source of list) {
-        // Listening *on* the signal being built is what unregisters the rest
-        // the moment any one of them fires, which is the part a naive version
-        // of this leaks.
-        source.addEventListener("abort", () => controller.abort(source.reason), {
-          once: true,
-          signal: controller.signal,
+  // One table, used twice: to fill, and then to re-check. A polyfill that did
+  // not take has to be as visible as one that was never written.
+  const needed: [Record<string, unknown> | undefined, string, string, unknown][] = [
+    [
+      promises,
+      "withResolvers",
+      "Promise.withResolvers",
+      function () {
+        let resolve!: (value: unknown) => void;
+        let reject!: (reason?: unknown) => void;
+        const promise = new Promise<unknown>((res, rej) => {
+          resolve = res;
+          reject = rej;
         });
-      }
-      return controller.signal;
-    };
-    filled.push("AbortSignal.any");
+        return { promise, resolve, reject };
+      },
+    ],
+    [
+      promises,
+      "try",
+      "Promise.try",
+      // Rejects when `fn` throws synchronously, because an executor that throws
+      // is how a `new Promise` rejects — which is the whole point of the method.
+      function (fn: (...args: unknown[]) => unknown, ...args: unknown[]) {
+        return new Promise((resolve) => {
+          resolve(fn(...args));
+        });
+      },
+    ],
+    [
+      urls,
+      "parse",
+      "URL.parse",
+      // `unknown` rather than `string`: pdf.js passes `window.location` as the
+      // base, and the constructor stringifies it as the real method does.
+      function (url: unknown, base?: unknown) {
+        try {
+          return base === undefined || base === null
+            ? new URL(url as string)
+            : new URL(url as string, base as string);
+        } catch {
+          return null;
+        }
+      },
+    ],
+    [
+      bytesProto,
+      "toBase64",
+      "Uint8Array.prototype.toBase64",
+      function (this: Uint8Array) {
+        // Chunked: `String.fromCharCode.apply` on a whole embedded font blows
+        // the argument limit, and this is called with exactly that.
+        let binary = "";
+        for (let at = 0; at < this.length; at += 0x8000) {
+          binary += String.fromCharCode.apply(null, Array.from(this.subarray(at, at + 0x8000)));
+        }
+        return btoa(binary);
+      },
+    ],
+    [
+      bytesProto,
+      "toHex",
+      "Uint8Array.prototype.toHex",
+      function (this: Uint8Array) {
+        let hex = "";
+        for (let at = 0; at < this.length; at++) {
+          hex += (this[at] as number).toString(16).padStart(2, "0");
+        }
+        return hex;
+      },
+    ],
+    [
+      bytes,
+      "fromBase64",
+      "Uint8Array.fromBase64",
+      function (encoded: string) {
+        const binary = atob(encoded);
+        const out = new Uint8Array(binary.length);
+        for (let at = 0; at < binary.length; at++) out[at] = binary.charCodeAt(at);
+        return out;
+      },
+    ],
+    [
+      buffers,
+      "transferToFixedLength",
+      "ArrayBuffer.prototype.transferToFixedLength",
+      // A copy, not a transfer: detaching the original cannot be emulated on an
+      // engine that lacks this method. Both of pdf.js's call sites trim a
+      // scratch buffer they drop immediately, so the only cost is that the
+      // original lives until the collector takes it.
+      function (this: ArrayBuffer, length?: number) {
+        return this.slice(0, length ?? this.byteLength);
+      },
+    ],
+    [
+      signals,
+      "any",
+      "AbortSignal.any",
+      function (sources: Iterable<AbortSignal>) {
+        const controller = new AbortController();
+        const list = Array.from(sources);
+        for (const source of list) {
+          if (source.aborted) {
+            controller.abort(source.reason);
+            return controller.signal;
+          }
+        }
+        for (const source of list) {
+          // Listening *on* the signal being built is what unregisters the rest
+          // the moment any one fires, which a naive version of this leaks.
+          source.addEventListener("abort", () => controller.abort(source.reason), {
+            once: true,
+            signal: controller.signal,
+          });
+        }
+        return controller.signal;
+      },
+    ],
+  ];
+
+  const filled: string[] = [];
+  for (const entry of needed) {
+    const owner = entry[0];
+    if (!owner || typeof owner[entry[1]] === "function") continue;
+    owner[entry[1]] = entry[3];
+    filled.push(entry[2]);
   }
 
-  const already = (scope["__pdfCompatFilled"] as string[] | undefined) ?? [];
-  scope["__pdfCompatFilled"] = already.concat(filled);
+  const missing: string[] = [];
+  for (const entry of needed) {
+    const owner = entry[0];
+    if (owner && typeof owner[entry[1]] !== "function") missing.push(entry[2]);
+  }
+
+  scope["__pdfCompat"] = { filled, missing };
+
+  // In a worker, say so out loud, before pdf.js has evaluated. A worker with no
+  // `document` is the only place this branch is taken; `pdfjs.ts` treats the
+  // message as the worker's fitness report and declines a worker that fails it.
+  const post = scope["postMessage"] as ((message: unknown) => void) | undefined;
+  if (typeof post === "function" && typeof scope["document"] === "undefined") {
+    post({ __pdfCompat: { filled, missing } });
+  }
 }
 
 /**
@@ -157,38 +253,20 @@ export function installPdfCompat(): void {
  */
 export const PDF_COMPAT_SOURCE = `(${installPdfCompat.toString()})();\n`;
 
-/**
- * What had to be filled in on *this* thread, for the dev self-test's report.
- *
- * Empty is the good answer and means the webview is current. Anything in it
- * names an engine older than pdf.js expects, which is the single most useful
- * fact to have when a platform starts behaving differently from the others.
- */
-export function pdfCompatFilled(): readonly string[] {
-  return ((globalThis as unknown as Record<string, unknown>)["__pdfCompatFilled"] as
-    | string[]
-    | undefined) ?? [];
+/** What this thread had to fill in, and what it could not. */
+export function pdfCompatHere(): PdfCompatReport {
+  return (
+    ((globalThis as unknown as Record<string, unknown>)["__pdfCompat"] as
+      | PdfCompatReport
+      | undefined) ?? { filled: [], missing: [] }
+  );
 }
 
-/**
- * Whether every built-in pdf.js needs is present now.
- *
- * Checked after installing rather than assumed: a polyfill that failed to take
- * would otherwise show up as the same silent hang it was written to prevent.
- */
-export function pdfCompatMissing(): readonly string[] {
-  const promises = Promise as unknown as Record<string, unknown>;
-  const urls = URL as unknown as Record<string, unknown>;
-  const signals = (globalThis as unknown as Record<string, unknown>)["AbortSignal"] as
-    | Record<string, unknown>
-    | undefined;
-
-  const missing: string[] = [];
-  if (typeof promises["withResolvers"] !== "function") missing.push("Promise.withResolvers");
-  if (typeof promises["try"] !== "function") missing.push("Promise.try");
-  if (typeof urls["parse"] !== "function") missing.push("URL.parse");
-  if (signals && typeof signals["any"] !== "function") missing.push("AbortSignal.any");
-  return missing;
+/** A short human-readable summary of a report, for error details and the self-test. */
+export function describePdfCompat(report: PdfCompatReport): string {
+  if (report.missing.length > 0) return `missing ${report.missing.join(", ")}`;
+  if (report.filled.length > 0) return `polyfilled ${report.filled.join(", ")}`;
+  return "all present natively";
 }
 
 // Installed on import, and this module is imported above `pdfjs-dist` in
