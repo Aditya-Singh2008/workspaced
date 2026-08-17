@@ -24,30 +24,49 @@
  *
  * ## What is and is not covered
  *
- * Everything `pdfjs-dist@5.5.207` reaches for above Safari 17.0, which is the
- * webview on the oldest macOS `tauri.conf.json` admits
- * (`minimumSystemVersion: "14.0"`):
+ * **Do not extend this list by reading pdf.js.** Three attempts to do that
+ * missed `Promise.try`, then `Uint8Array.prototype.toHex`, then
+ * `Map.prototype.getOrInsertComputed` — each one a separate bug report from a
+ * Mac, because each time the list named the newest API someone happened to
+ * notice rather than the newest one present. **Derive it**, with the two steps
+ * below; they take a couple of minutes and they are exhaustive.
  *
- *   - **Safari 18.2** — `Promise.try`, `Uint8Array.prototype.toBase64`,
- *     `Uint8Array.prototype.toHex`, `Uint8Array.fromBase64`.
- *   - **Safari 18.0** — `URL.parse`.
- *   - **Safari 17.4** — `Promise.withResolvers`, `AbortSignal.any`,
- *     `ArrayBuffer.prototype.transferToFixedLength`.
+ * 1. **Extract every method name pdf.js calls** — `/\.([A-Za-z][\w$]*)\s*\(/g`
+ *    over `pdf.mjs` and `pdf.worker.mjs` — and drop the ones that are functions
+ *    on any built-in in **Node 20**, which is the old-engine baseline.
+ * 2. **Ask a modern WebKit which of the survivors it recognises**, by testing
+ *    the same names against the same built-ins from a webkit2gtk page. Anything
+ *    WebKit has and Node 20 does not was added in the last couple of years —
+ *    which is precisely the window where a macOS system WebKit can be behind,
+ *    since WKWebView tracks Safari and not the OS version.
  *
- * Every one is called unguarded, and two are on the path every document takes.
+ * What that produced, for `pdfjs-dist@5.5.207` against Safari 17.0 (the webview
+ * on the oldest macOS `tauri.conf.json` admits, `minimumSystemVersion: "14.0"`):
  *
- * Left alone, deliberately: `Math.sumPrecise`, which pdf.js polyfills itself;
- * `Float16Array` and `ImageDecoder`, which sit behind `FeatureTest` so pdf.js
- * takes another path without them; and `Set.prototype.intersection`,
- * `findLast`, `at`, `replaceAll`, `structuredClone` and `FinalizationRegistry`,
- * which are at or below the floor.
+ *   - `Promise.try`, `Uint8Array.prototype.toBase64`,
+ *     `Uint8Array.prototype.toHex`, `Uint8Array.fromBase64` (Safari 18.2).
+ *   - `URL.parse` (18.0).
+ *   - `Promise.withResolvers`, `AbortSignal.any`,
+ *     `ArrayBuffer.prototype.transferToFixedLength` (17.4).
+ *   - `Map.prototype.getOrInsertComputed`, newer still, and on the path every
+ *     *render* takes — `PDFPageProxy.render` opens with it.
+ *   - `Set.prototype.intersection` (17.0). Exactly at the floor, so covered
+ *     here rather than trusted.
  *
- * **This list was arrived at twice by reading and was wrong both times**, each
- * time costing a round trip to a Mac. Reading finds candidates; it does not
- * finish the job. The way to finish is to delete the whole post-17.0 surface
- * from a webkit2gtk page *and* from the worker blob (intercept `Blob`; a worker
- * is another realm) and run `selftest.ts` plus a real font-embedding PDF until
- * both are green. Do that whenever the pdf.js pin moves.
+ * Every one is called unguarded. Two are on the path every document takes and
+ * one is on the path every page takes.
+ *
+ * The step-2 sweep also reports `Iterator.prototype.take`,
+ * `Iterator.prototype.toArray` and `Math.sumPrecise`. None of them are real:
+ * the first two are name collisions with pdf.js's own `take()` and `toArray()`,
+ * and pdf.js ships its own `Math.sumPrecise`. Check the call sites before
+ * adding anything. `Float16Array` and `ImageDecoder` are likewise left alone —
+ * both sit behind `FeatureTest`, so pdf.js takes another path without them.
+ *
+ * Then **prove the result** rather than trusting it: delete the whole derived
+ * surface from a webkit2gtk page *and* from the worker blob (intercept `Blob`;
+ * a worker is another realm) and run `selftest.ts` plus a real font-embedding
+ * PDF until both are green. Do all of this whenever the pdf.js pin moves.
  *
  * Polyfilling rather than raising `minimumSystemVersion` is the deliberate
  * choice: these are small functions, and the alternative refuses to install on
@@ -96,6 +115,9 @@ export function installPdfCompat(): void {
   const bytes = Uint8Array as unknown as Record<string, unknown>;
   const bytesProto = Uint8Array.prototype as unknown as Record<string, unknown>;
   const buffers = ArrayBuffer.prototype as unknown as Record<string, unknown>;
+  const maps = Map.prototype as unknown as Record<string, unknown>;
+  const weakMaps = WeakMap.prototype as unknown as Record<string, unknown>;
+  const sets = Set.prototype as unknown as Record<string, unknown>;
   const signals = scope["AbortSignal"] as Record<string, unknown> | undefined;
 
   // One table, used twice: to fill, and then to re-check. A polyfill that did
@@ -190,6 +212,40 @@ export function installPdfCompat(): void {
       // original lives until the collector takes it.
       function (this: ArrayBuffer, length?: number) {
         return this.slice(0, length ?? this.byteLength);
+      },
+    ],
+    [
+      maps,
+      "getOrInsertComputed",
+      "Map.prototype.getOrInsertComputed",
+      function (this: Map<unknown, unknown>, key: unknown, compute: (key: unknown) => unknown) {
+        if (this.has(key)) return this.get(key);
+        const value = compute(key);
+        this.set(key, value);
+        return value;
+      },
+    ],
+    [
+      weakMaps,
+      "getOrInsertComputed",
+      "WeakMap.prototype.getOrInsertComputed",
+      function (this: WeakMap<object, unknown>, key: object, compute: (key: object) => unknown) {
+        if (this.has(key)) return this.get(key);
+        const value = compute(key);
+        this.set(key, value);
+        return value;
+      },
+    ],
+    [
+      sets,
+      "intersection",
+      "Set.prototype.intersection",
+      // The specified version walks whichever collection is smaller; for the
+      // one call site in pdf.js the result is the same either way.
+      function (this: Set<unknown>, other: { has(value: unknown): boolean }) {
+        const shared = new Set<unknown>();
+        for (const value of this) if (other.has(value)) shared.add(value);
+        return shared;
       },
     ],
     [
