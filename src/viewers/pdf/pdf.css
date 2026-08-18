@@ -120,6 +120,21 @@
   z-index: 1;
   line-height: 1;
   text-align: initial;
+  /*
+   * All three spellings, as pdf.js ships them, and the prefixed ones are not
+   * decoration. **Safari implements only `-webkit-text-size-adjust`** — the
+   * unprefixed property does nothing there — and the build does not add the
+   * prefix (checked in `dist/`: it prefixes `user-select` and leaves this
+   * alone). So the one spelling that was here was the one WKWebView ignores,
+   * which left macOS the only target where the guard was absent.
+   *
+   * What the guard is for: autosizing rescales *text* and not the canvas under
+   * it, and this layer's whole job is invisible glyph boxes that sit exactly
+   * over painted ones. Any engine that inflates them independently leaves the
+   * reader dragging across words and selecting the wrong ones, or nothing.
+   */
+  -webkit-text-size-adjust: none;
+  -moz-text-size-adjust: none;
   text-size-adjust: none;
   forced-color-adjust: none;
   transform-origin: 0 0;
@@ -141,6 +156,19 @@
   cursor: text;
   white-space: pre;
   transform-origin: 0% 0%;
+  /*
+   * Selectable, said out loud rather than inherited.
+   *
+   * pdf.js leaves this at its initial value because its spans live in a page
+   * the library controls. Here they live inside a docking library's panel,
+   * inside an app whose chrome is deliberately not selectable, and a single
+   * `user-select: none` landing on any ancestor — dockview's, a future rule of
+   * ours — would make an entire document unselectable with nothing in the
+   * layout to show for it. This is the one element in the app that *must* take
+   * a selection, so it claims it.
+   */
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .pdf-page .textLayer > :not(.markedContent),
@@ -208,6 +236,25 @@
 
 .pdf-page .textLayer.selecting .endOfContent {
   top: 0;
+}
+
+/*
+ * pdf.js's font-measuring canvas, which it appends to `document.body` itself.
+ *
+ * `TextLayer.#getCtx` creates one per document language, names it this, and
+ * relies on the host stylesheet to keep it out of the layout — the rule is in
+ * `pdf_viewer.css`, which this app does not import. Without it the element is a
+ * real 300x150 inline canvas at the end of `<body>`, kept off screen only by
+ * `body { overflow: hidden }`. That is luck, not design: it is the kind of stray
+ * box that reappears the moment anything about the body's layout changes.
+ */
+.hiddenCanvasElement {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: none;
+  height: 0;
+  width: 0;
 }
 
 /* ---------------------------------------------------------------------------

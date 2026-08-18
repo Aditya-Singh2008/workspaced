@@ -48,7 +48,7 @@ import { pdfKeybinds, pdfToolbarControls, type PdfActions } from "./actions";
 import { PdfAnnotator } from "./annotate";
 import { PDF_PLUGIN_ID } from "./id";
 import { getPdfOcr } from "./ocr";
-import type { PdfDocument } from "./pdfjs";
+import { pdfEnvironment, type PdfDocument } from "./pdfjs";
 import { printDocument } from "./print";
 import { parsePdfState, type PdfViewerState } from "./state";
 import { PdfTextAnnotator } from "./textAnnotate";
@@ -174,6 +174,30 @@ export class PdfViewerInstance extends BaseViewerInstance implements ViewerInsta
           // and the console and `devLog` that used to carry the difference are
           // both unreachable in a release build, which is where these are seen.
           this.#view.announce(`page ${pageNumber} could not be rendered — ${detail}`, "warn");
+        },
+        // The page is on screen and readable; it is selection that is missing.
+        // Said out loud for the reason every other failure here is: this one
+        // used to be swallowed entirely, so "I cannot select text in this PDF"
+        // arrived with no way to tell a scanned page from a decoder that never
+        // answered from an engine that threw laying the spans out. The
+        // environment rides along on the message, because the self-test panel
+        // is stripped from release builds and these are read in screenshots.
+        onTextLayerError: (pageNumber, thrown) => {
+          const detail = thrown instanceof Error ? thrown.message : String(thrown);
+          console.error(`[pdf] page ${pageNumber} has no selectable text layer`, thrown);
+          if (import.meta.env.DEV) {
+            void import("../../dev/log").then(({ devLog }) =>
+              devLog(`pdf: page ${pageNumber} text layer failed — ${detail}`),
+            );
+          }
+          // A deadline names the environment itself, so only the other
+          // failures need it added — saying it twice reads as a bug in the
+          // message rather than as detail about the engine.
+          const where = detail.includes("[pdf.js ") ? "" : ` [${pdfEnvironment()}]`;
+          this.#view.announce(
+            `text on page ${pageNumber} cannot be selected — ${detail}${where}`,
+            "warn",
+          );
         },
         // Fires during the view's own construction, before `#annotator` is
         // assigned — hence the optional call rather than an assertion.

@@ -27,6 +27,7 @@
 
 import {
   isRenderCancellation,
+  isTextLayerCancellation,
   pdfjs,
   withinDeadline,
   type PdfDocument,
@@ -60,8 +61,24 @@ const MAX_CANVAS_PIXELS = 2 ** 24;
  */
 const RENDER_MS = 30_000;
 
+/**
+ * How long each half of building a text layer gets: reading the page's text,
+ * and laying it out.
+ *
+ * Shorter than a render because neither half rasterises anything, and for the
+ * same reason a render has a deadline at all: `getTextContent()` is a round trip
+ * to the decoder, and the way this plugin's dependencies fail on an unfamiliar
+ * webview is by never answering. Without this, an unanswered text request is a
+ * document whose words cannot be selected, with nothing anywhere saying why.
+ */
+const TEXT_LAYER_MS = 20_000;
+
 /** The square the ink probe shrinks a page into. See {@link hasInk}. */
 const INK_PROBE = 32;
+
+function describe(thrown: unknown): string {
+  return thrown instanceof Error ? thrown.message : String(thrown);
+}
 
 /**
  * Whether anything at all was drawn onto `canvas`.
@@ -406,6 +423,22 @@ export class PdfPageView {
    * pdf.js positions transparent spans against `--total-scale-factor` and sizes
    * the container through `setLayerDimensions`, so both have to be set before
    * rendering or every span lands in the top-left corner.
+   *
+   * ## Why this throws instead of returning
+   *
+   * It used to swallow everything: two bare `catch { return; }` clauses, a
+   * constructor outside any `try`, and no deadline. Every way this can fail
+   * therefore produced the *same* observable state as a page that simply has no
+   * text — an inert layer, nothing in the strip, nothing in the console — and
+   * "selection does not work" is then a sentence with a dozen causes and no way
+   * to tell them apart from outside the webview. That is the exact shape of the
+   * blank-page bug (AGENTS.md, open item 4b) one layer further on, and it is
+   * fixed the same way: **report rather than guess.**
+   *
+   * A failure here is not a failed document — the page still renders and still
+   * scrolls — so it is thrown for `view.ts` to route into the status strip and
+   * left non-fatal. A page that genuinely has no text (a scan) is not a failure
+   * and does not throw.
    */
   async buildTextLayer(
     document_: PdfDocument,
@@ -416,14 +449,22 @@ export class PdfPageView {
     this.#cancelTextLayer();
 
     let page: PdfPage;
-    let content;
+    let content: Awaited<ReturnType<PdfPage["getTextContent"]>>;
     try {
       // pdf.js caches page proxies, so this does not re-fetch anything.
       page = await document_.getPage(this.pageNumber);
-      content = await page.getTextContent();
-    } catch {
-      this.textLayer.classList.add("is-empty");
-      return;
+      // Deadlined for the same reason the render is: this is a round trip to
+      // the decoder, and the failure this plugin keeps meeting on unfamiliar
+      // webviews is one that never settles rather than one that rejects.
+      content = await withinDeadline(
+        page.getTextContent(),
+        TEXT_LAYER_MS,
+        `reading the text of page ${this.pageNumber}`,
+      );
+    } catch (thrown) {
+      this.#syncEmptyClass();
+      if (!isCurrent()) return;
+      throw new Error(`its text could not be read — ${describe(thrown)}`);
     }
     if (!isCurrent() || !this.rendered) return;
 
@@ -437,25 +478,49 @@ export class PdfPageView {
     this.textLayer.replaceChildren();
     const viewport = page.getViewport({ scale });
     this.textLayer.style.setProperty("--total-scale-factor", String(scale));
-    pdfjs.setLayerDimensions(this.textLayer, viewport);
-
-    const layer = new pdfjs.TextLayer({
-      textContentSource: content,
-      container: this.textLayer,
-      viewport,
-    });
-    this.#textLayerTask = layer;
 
     try {
-      await layer.render();
-    } catch {
-      return;
+      // Inside the `try`: `setLayerDimensions` and the `TextLayer` constructor
+      // both run engine code on the page — CSS `round()`, `Promise.withResolvers`,
+      // a canvas context, a layout measurement — and a throw from either used to
+      // escape as an unhandled rejection with the layer left inert.
+      pdfjs.setLayerDimensions(this.textLayer, viewport);
+      const layer = new pdfjs.TextLayer({
+        textContentSource: content,
+        container: this.textLayer,
+        viewport,
+      });
+      this.#textLayerTask = layer;
+      await withinDeadline(
+        layer.render(),
+        TEXT_LAYER_MS,
+        `laying out the text of page ${this.pageNumber}`,
+      );
+    } catch (thrown) {
+      // A cancelled layer is this class cancelling it — a scroll, a zoom, a
+      // closing tile — and says nothing about the engine.
+      this.#textLayerTask = null;
+      this.#syncEmptyClass();
+      if (!isCurrent() || isTextLayerCancellation(thrown)) return;
+      throw new Error(`its text could not be laid out — ${describe(thrown)}`);
     }
     if (!isCurrent()) return;
 
     this.#textLayerTask = null;
     this.#textLayerScale = scale;
-    this.textLayer.classList.toggle("is-empty", !this.textLayer.childElementCount);
+    this.#syncEmptyClass();
+  }
+
+  /**
+   * Keeps `is-empty` — which is what takes the pointer away from the layer —
+   * saying what is actually in the layer.
+   *
+   * Called on every exit, including the failing ones. A partial layer that kept
+   * the class was the worst of the old behaviour: spans over the words, the
+   * text cursor over them, and a drag that selected nothing.
+   */
+  #syncEmptyClass(): void {
+    this.textLayer.classList.toggle("is-empty", this.textLayer.childElementCount === 0);
   }
 
   #cancelTextLayer(): void {

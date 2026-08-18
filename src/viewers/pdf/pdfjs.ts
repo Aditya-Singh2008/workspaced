@@ -565,6 +565,20 @@ export function isRenderCancellation(thrown: unknown): boolean {
 }
 
 /**
+ * The same question for a text layer, which rejects with a different exception.
+ *
+ * `TextLayer.cancel()` rejects its capability with an `AbortException`, and it
+ * is called on every scroll, zoom and tile close — so this is the common case
+ * here too, and must stay as silent as its render counterpart.
+ */
+export function isTextLayerCancellation(thrown: unknown): boolean {
+  return (
+    thrown instanceof pdfjs.AbortException ||
+    (thrown instanceof Error && thrown.name === "AbortException")
+  );
+}
+
+/**
  * `work`, or a rejection naming the deadline it outran.
  *
  * Exported because opening a document is more than starting a worker, and the

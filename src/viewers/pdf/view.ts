@@ -82,6 +82,15 @@ export interface PdfViewCallbacks {
   /** A render failed for a reason that is not cancellation. */
   onRenderError(pageNumber: number, thrown: unknown): void;
   /**
+   * A page's selectable text overlay could not be built.
+   *
+   * Separate from `onRenderError` because it is a different sentence to the
+   * reader — the page is on screen and readable, and it is *selection* that is
+   * missing — and because it must not read as "this page failed to render" when
+   * the page plainly did.
+   */
+  onTextLayerError(pageNumber: number, thrown: unknown): void;
+  /**
    * The scale changed, or a page's box did.
    *
    * Anything drawn *over* a page in page coordinates needs to hear about both:
@@ -135,6 +144,8 @@ export class PdfView {
   #everPainted = false;
   /** So the "nothing is reaching the screen" line is said once, not per page. */
   #reportedBlank = false;
+  /** Pages whose text layer has already had its failure reported. */
+  #reportedTextFailure = new Set<number>();
   /** Page numbers wanted on screen right now, re-derived on every scroll. */
   #wanted = new Set<number>();
   #activeRenders = 0;
@@ -641,7 +652,16 @@ export class PdfView {
     for (const pageNumber of this.#wanted) {
       const page = this.pages[pageNumber - 1];
       if (page?.rendered) {
-        void page.buildTextLayer(this.#document, this.#scale, isCurrent);
+        // The settle pass re-runs after every scroll and every render, so a
+        // page that keeps failing would keep reporting; `#reportedTextFailure`
+        // holds it to once per page. The *retry* is deliberate — a text layer
+        // that failed once on a busy frame should get another go — it is only
+        // the sentence that is said once.
+        page.buildTextLayer(this.#document, this.#scale, isCurrent).catch((thrown) => {
+          if (!isCurrent() || this.#reportedTextFailure.has(pageNumber)) return;
+          this.#reportedTextFailure.add(pageNumber);
+          this.#callbacks.onTextLayerError(pageNumber, thrown);
+        });
       }
     }
   }
