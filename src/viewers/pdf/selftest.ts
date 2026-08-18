@@ -50,9 +50,11 @@ import {
   FIXTURE_OCR_PAGE,
   FIXTURE_PAGE_COUNT,
   FIXTURE_PAGE_ONE_TEXT,
+  FIXTURE_PAGE_SIZE,
 } from "./dev/fixture";
 import { PDF_PLUGIN_ID } from "./id";
 import type { PdfViewerInstance } from "./instance";
+import type { PdfDocument } from "./pdfjs";
 
 const TITLE = "pdf viewer plugin";
 
@@ -63,6 +65,7 @@ export async function runPdfSelfTest(): Promise<SelfTestReport> {
   const environment = await probeRenderEnvironment();
   checks.push(environment.check);
   checks.push(...(await lifecycleChecks(environment.canRender)));
+  checks.push(await renderSlotCheck(environment.canRender));
   checks.push(await viewportAgreementCheck());
   return report(TITLE, checks);
 }
@@ -1068,6 +1071,90 @@ async function viewportAgreementCheck(): Promise<SelfTestCheck> {
       false,
       thrown instanceof Error ? (thrown.stack ?? thrown.message) : String(thrown),
     );
+  }
+}
+
+/** The name is used twice, so it is written once. */
+const RENDER_SLOT_CHECK = "a render cancelled while it waits releases the page cleanly";
+
+/**
+ * A page cancelled *before it has a render task* does not collide with the
+ * render that replaces it.
+ *
+ * `PdfPageView.render` claims its slot, then awaits `getPage`, and a
+ * cancellation arriving in that window has nothing to cancel — so the check is
+ * whether the suspended call notices it was replaced, or wakes up and draws on
+ * top of the attempt that took the page over. pdf.js's answer to two renders on
+ * one canvas is to refuse the second outright, which reached a user as a page
+ * that renders correctly with "Cannot use the same canvas during multiple
+ * render() operations" in the strip above it, on macOS, where a cold decoder
+ * makes that window wide enough for the opening fit-to-width to land in it.
+ *
+ * Reproduced here rather than waited for: `getPage` is slowed so the sequence
+ * is deterministic on a machine whose decoder answers in a millisecond.
+ */
+async function renderSlotCheck(canRender: boolean): Promise<SelfTestCheck> {
+  if (!canRender) return skip(RENDER_SLOT_CHECK, NO_COMPOSITOR);
+
+  const container = scratchContainer();
+  try {
+    const [{ loadPdfDocument }, { PdfPageView }] = await Promise.all([
+      import("./pdfjs"),
+      import("./page"),
+    ]);
+    const document_ = await (await loadPdfDocument({ data: buildFixturePdf() })).promise;
+
+    // `render` asks the document for nothing but its page, so a stand-in that
+    // answers slowly is the whole of what this needs.
+    const slow = {
+      getPage: async (pageNumber: number) => {
+        await pause(80);
+        return document_.getPage(pageNumber);
+      },
+    } as unknown as PdfDocument;
+
+    const page = new PdfPageView(1, FIXTURE_PAGE_SIZE);
+    container.append(page.root);
+    page.layout(1);
+
+    const failures: string[] = [];
+    const record = (which: string) => (thrown: unknown) => {
+      failures.push(`${which}: ${thrown instanceof Error ? thrown.message : String(thrown)}`);
+    };
+
+    const first = page.render(slow, 1, () => true).catch(record("the cancelled render"));
+    await pause(20); // still inside `getPage`, so there is no task to cancel
+    page.markStale(); // exactly what a zoom does to every page
+    const second = page.render(slow, 1.5, () => true).catch(record("the replacement render"));
+    await within(Promise.all([first, second]), 20_000, "the two renders");
+
+    // The survivor has to be the *second* attempt. A page left rendered at 1.0
+    // would mean the cancelled render drew anyway and won the race it had
+    // already lost — the same collision, landing as stale pixels instead of an
+    // error.
+    if (!page.rendered) failures.push("neither render left the page rendered");
+    else if (page.isStaleAt(1.5) || !page.isStaleAt(1)) {
+      failures.push("the page kept the cancelled render's scale");
+    }
+
+    page.destroy();
+    await document_.destroy();
+
+    return check(
+      RENDER_SLOT_CHECK,
+      failures.length === 0,
+      failures.length === 0
+        ? "cancelled mid-`getPage`, the replacement render owns the canvas alone"
+        : failures.join("; "),
+    );
+  } catch (thrown) {
+    return check(
+      RENDER_SLOT_CHECK,
+      false,
+      thrown instanceof Error ? (thrown.stack ?? thrown.message) : String(thrown),
+    );
+  } finally {
+    container.remove();
   }
 }
 

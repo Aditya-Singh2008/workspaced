@@ -47,14 +47,16 @@
  *     `Uint8Array.prototype.toHex`, `Uint8Array.fromBase64` (Safari 18.2).
  *   - `URL.parse` (18.0).
  *   - `Promise.withResolvers`, `AbortSignal.any`,
- *     `ArrayBuffer.prototype.transferToFixedLength` (17.4).
+ *     `ArrayBuffer.prototype.transferToFixedLength`,
+ *     `ReadableStream.prototype[Symbol.asyncIterator]` (17.4).
  *   - `Map.prototype.getOrInsertComputed`, newer still, and on the path every
  *     *render* takes — `PDFPageProxy.render` opens with it.
  *   - `Set.prototype.intersection` (17.0). Exactly at the floor, so covered
  *     here rather than trusted.
  *
- * Every one is called unguarded. Two are on the path every document takes and
- * one is on the path every page takes.
+ * Every one is called unguarded. Two are on the path every document takes, one
+ * is on the path every page takes, and one — the stream iterator, which the
+ * section below is about — is on the path every *text layer* takes.
  *
  * The step-2 sweep also reports `Iterator.prototype.take`,
  * `Iterator.prototype.toArray` and `Math.sumPrecise`. None of them are real:
@@ -62,6 +64,30 @@
  * and pdf.js ships its own `Math.sumPrecise`. Check the call sites before
  * adding anything. `Float16Array` and `ImageDecoder` are likewise left alone —
  * both sit behind `FeatureTest`, so pdf.js takes another path without them.
+ *
+ * ## The derivation has one blind spot: built-ins nothing calls by name
+ *
+ * `ReadableStream.prototype[Symbol.asyncIterator]` (Safari 17.4) is on this list
+ * and no regex over `.method(` could ever have found it, because pdf.js never
+ * writes its name. `PDFPageProxy.getTextContent` collects the decoder's answer
+ * with `for await (const value of readableStream)`, and that syntax *is* the
+ * call: the engine looks up `@@asyncIterator` on the stream and invokes what it
+ * finds. On an engine that has no such method it finds `undefined` and throws
+ * `TypeError: undefined is not a function`, from inside a `for` loop, naming
+ * nothing. It reached a user as "the PDF renders but no text can be selected,
+ * and only on macOS" — the same shape as every entry above, one layer further
+ * on, because text is the *only* thing that path carries.
+ *
+ * So step 1 of the derivation misses anything the language calls on a program's
+ * behalf. There are not many such protocols, and the way to cover them is to
+ * grep for the syntax rather than for a name: `for await` and `yield*` (both
+ * `@@asyncIterator`/`@@iterator`), spread and destructuring of anything that is
+ * not an array (`@@iterator`), `instanceof` (`@@hasInstance`). Of those,
+ * `for await` over a **`ReadableStream`** is the only one that lands on a
+ * built-in recent enough to be missing here — the iterables pdf.js spreads are
+ * its own arrays and maps, whose protocols are as old as the engine. Both of
+ * its `for await` loops are over streams: the text one, and
+ * `decompressSignature`'s over a `DecompressionStream`.
  *
  * Then **prove the result** rather than trusting it: delete the whole derived
  * surface from a webkit2gtk page *and* from the worker blob (intercept `Blob`;
@@ -109,20 +135,72 @@ export interface PdfCompatReport {
  * Idempotent.
  */
 export function installPdfCompat(): void {
-  const scope = globalThis as unknown as Record<string, unknown>;
-  const promises = Promise as unknown as Record<string, unknown>;
-  const urls = URL as unknown as Record<string, unknown>;
-  const bytes = Uint8Array as unknown as Record<string, unknown>;
-  const bytesProto = Uint8Array.prototype as unknown as Record<string, unknown>;
-  const buffers = ArrayBuffer.prototype as unknown as Record<string, unknown>;
-  const maps = Map.prototype as unknown as Record<string, unknown>;
-  const weakMaps = WeakMap.prototype as unknown as Record<string, unknown>;
-  const sets = Set.prototype as unknown as Record<string, unknown>;
-  const signals = scope["AbortSignal"] as Record<string, unknown> | undefined;
+  // `string | symbol` throughout because one of the entries below is keyed by
+  // `Symbol.asyncIterator` rather than by a name.
+  type Slots = Record<string | symbol, unknown>;
+  const scope = globalThis as unknown as Slots;
+  const promises = Promise as unknown as Slots;
+  const urls = URL as unknown as Slots;
+  const bytes = Uint8Array as unknown as Slots;
+  const bytesProto = Uint8Array.prototype as unknown as Slots;
+  const buffers = ArrayBuffer.prototype as unknown as Slots;
+  const maps = Map.prototype as unknown as Slots;
+  const weakMaps = WeakMap.prototype as unknown as Slots;
+  const sets = Set.prototype as unknown as Slots;
+  const signals = scope["AbortSignal"] as Slots | undefined;
+  const streams = (scope["ReadableStream"] as { prototype?: Slots } | undefined)?.prototype;
+
+  // `ReadableStream.prototype.values`, which `for await` reaches through
+  // `@@asyncIterator`. Written once and installed under both names below,
+  // because the specified `@@asyncIterator` *is* `values` — an engine with one
+  // and not the other does not exist, and two implementations of it could drift.
+  //
+  // Defined inside this function like everything else here: the worker gets
+  // this file as text (see `PDF_COMPAT_SOURCE`), so a helper in module scope
+  // would be a name that does not exist over there.
+  function values(this: ReadableStream, options?: { preventCancel?: boolean }) {
+    // Acquired now rather than on the first `next()`, as the specification has
+    // it: taking the lock is what makes a second concurrent iteration of the
+    // same stream throw instead of silently splitting the chunks between them.
+    const reader = this.getReader();
+    const preventCancel = Boolean(options?.preventCancel);
+    return {
+      async next() {
+        try {
+          const step = await reader.read();
+          // The lock has to go back on the last chunk, not just on `return()`:
+          // a loop that runs to completion never calls `return()`, and a stream
+          // left locked cannot be read or cancelled by anyone afterwards.
+          if (step.done) reader.releaseLock();
+          return step;
+        } catch (thrown) {
+          reader.releaseLock();
+          throw thrown;
+        }
+      },
+      // `break`, `throw`, and every early exit out of a `for await` land here.
+      async return(value?: unknown) {
+        if (preventCancel) {
+          reader.releaseLock();
+        } else {
+          // Ordered as the specification orders it: start the cancel while the
+          // lock is still held, release, then wait. Releasing first would let
+          // the cancel reject on a reader that no longer owns the stream.
+          const cancelled = reader.cancel(value);
+          reader.releaseLock();
+          await cancelled;
+        }
+        return { value, done: true };
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  }
 
   // One table, used twice: to fill, and then to re-check. A polyfill that did
   // not take has to be as visible as one that was never written.
-  const needed: [Record<string, unknown> | undefined, string, string, unknown][] = [
+  const needed: [Slots | undefined, string | symbol, string, unknown][] = [
     [
       promises,
       "withResolvers",
@@ -272,6 +350,8 @@ export function installPdfCompat(): void {
         return controller.signal;
       },
     ],
+    [streams, "values", "ReadableStream.prototype.values", values],
+    [streams, Symbol.asyncIterator, "ReadableStream.prototype[Symbol.asyncIterator]", values],
   ];
 
   const filled: string[] = [];

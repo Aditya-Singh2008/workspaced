@@ -171,8 +171,36 @@ export class PdfPageView {
    * second render of the same page.
    */
   #renderTask: pdfjs.RenderTask | true | null = null;
+
+  /**
+   * Which attempt owns {@link #renderTask}. Bumped by every cancellation.
+   *
+   * The claim above is necessary and was not sufficient, because a render can
+   * lose it while it is suspended and has nothing to cancel: between claiming
+   * the slot and `page.render()` there is an `await` on `getPage`, and
+   * {@link cancelRender} arriving in that window used to just set the slot back
+   * to `null` — the suspended call held no task yet, so there was nothing to
+   * stop, and it woke up and drew anyway. Meanwhile the freed slot let the next
+   * scroll or zoom start a *second* render of the same page, and pdf.js refuses
+   * two renders of one canvas outright: "Cannot use the same canvas during
+   * multiple render() operations". That reached a user as a page that renders
+   * correctly with an error in the strip above it, on macOS, where the first
+   * `getPage` of a document is slow enough for the opening fit-to-width to land
+   * inside the window.
+   *
+   * So cancellation is a number that goes up rather than a task to stop, and a
+   * suspended render compares it on the far side of every `await`. One that no
+   * longer owns the slot draws nothing and touches nothing — the state it would
+   * be writing belongs to whoever cancelled it.
+   */
+  #renderAttempt = 0;
   #textLayerTask: pdfjs.TextLayer | null = null;
   #textLayerScale = 0;
+
+  /** The scale a build is running at, or `null` when none is. */
+  #textLayerBuilding: number | null = null;
+  /** {@link #renderAttempt} for text layers. See {@link buildTextLayer}. */
+  #textLayerAttempt = 0;
 
   constructor(pageNumber: number, dimensions: { width: number; height: number }) {
     this.pageNumber = pageNumber;
@@ -262,6 +290,9 @@ export class PdfPageView {
 
   /** Aborts an in-flight render. Used when a page scrolls out of range. */
   cancelRender(): void {
+    // First, and whether or not there is a task: a render that is still
+    // suspended has no task to cancel, and this is the only thing that stops it.
+    this.#renderAttempt += 1;
     if (this.#renderTask && this.#renderTask !== true) {
       try {
         this.#renderTask.cancel();
@@ -286,16 +317,23 @@ export class PdfPageView {
     if (this.busy) return;
     if (this.rendered && !this.isStaleAt(scale)) return;
     this.#renderTask = true;
+    const attempt = ++this.#renderAttempt;
+    /** Whether this call still owns the slot it claimed. See {@link #renderAttempt}. */
+    const mine = (): boolean => this.#renderAttempt === attempt;
+    /** Gives the slot back, unless it now belongs to a later attempt. */
+    const release = (): void => {
+      if (mine()) this.#renderTask = null;
+    };
 
     let page: PdfPage;
     try {
       page = await document_.getPage(this.pageNumber);
     } catch {
-      this.#renderTask = null;
+      release();
       return;
     }
-    if (!isCurrent()) {
-      this.#renderTask = null;
+    if (!mine() || !isCurrent()) {
+      release();
       return;
     }
 
@@ -333,7 +371,7 @@ export class PdfPageView {
       willReadFrequently: true,
     });
     if (!context) {
-      this.#renderTask = null;
+      release();
       return;
     }
 
@@ -392,7 +430,7 @@ export class PdfPageView {
       });
     } catch (thrown) {
       cancelAnimationFrame(frame);
-      this.#renderTask = null;
+      release();
       // Cancellation is the *normal* case here — a scroll past, a zoom, a
       // closed tile — and must stay silent. Anything else is worth reporting.
       if (isRenderCancellation(thrown)) return;
@@ -409,8 +447,13 @@ export class PdfPageView {
     }
 
     cancelAnimationFrame(frame);
-    this.#renderTask = null;
-    if (!isCurrent()) return;
+    // A render that lost the slot while it was drawing can still land here —
+    // it finished in the gap between the cancellation and the rejection. Its
+    // pixels are fine and stay on the canvas, but the bookkeeping below belongs
+    // to whichever attempt owns the page now, so leave it alone.
+    const owned = mine();
+    release();
+    if (!owned || !isCurrent()) return;
 
     this.rendered = true;
     this.#renderedScale = scale;
@@ -439,6 +482,18 @@ export class PdfPageView {
    * scrolls — so it is thrown for `view.ts` to route into the status strip and
    * left non-fatal. A page that genuinely has no text (a scan) is not a failure
    * and does not throw.
+   *
+   * ## One build at a time
+   *
+   * The settle pass asks for a layer after every scroll and every completed
+   * render, and reading a dense page's text can easily outlast the settle
+   * interval — so this can be re-entered while the previous call is still
+   * waiting on the decoder. Nothing about the old guard stopped that: it asked
+   * whether the layer *exists*, and while the first call is suspended it does
+   * not. Both calls would then `replaceChildren()` the same container and append
+   * into it from two `TextLayer`s at once, which is a page whose words are
+   * selectable twice. {@link #textLayerAttempt} is the render slot's mechanism
+   * applied to the same problem.
    */
   async buildTextLayer(
     document_: PdfDocument,
@@ -446,8 +501,30 @@ export class PdfPageView {
     isCurrent: () => boolean,
   ): Promise<void> {
     if (this.hasTextLayer && Math.abs(this.#textLayerScale - scale) < 0.001) return;
+    // A build already under way for this scale will finish on its own. One for
+    // a *stale* scale is cancelled instead: its spans would be positioned for a
+    // zoom level nobody is looking at any more.
+    if (this.#textLayerBuilding !== null && Math.abs(this.#textLayerBuilding - scale) < 0.001) {
+      return;
+    }
     this.#cancelTextLayer();
+    const attempt = ++this.#textLayerAttempt;
+    const mine = (): boolean => this.#textLayerAttempt === attempt;
+    this.#textLayerBuilding = scale;
+    try {
+      await this.#buildTextLayer(document_, scale, isCurrent, mine);
+    } finally {
+      if (mine()) this.#textLayerBuilding = null;
+    }
+  }
 
+  /** {@link buildTextLayer}'s body, with the slot already claimed. */
+  async #buildTextLayer(
+    document_: PdfDocument,
+    scale: number,
+    isCurrent: () => boolean,
+    mine: () => boolean,
+  ): Promise<void> {
     let page: PdfPage;
     let content: Awaited<ReturnType<PdfPage["getTextContent"]>>;
     try {
@@ -463,10 +540,10 @@ export class PdfPageView {
       );
     } catch (thrown) {
       this.#syncEmptyClass();
-      if (!isCurrent()) return;
+      if (!mine() || !isCurrent()) return;
       throw new Error(`its text could not be read — ${describe(thrown)}`);
     }
-    if (!isCurrent() || !this.rendered) return;
+    if (!mine() || !isCurrent() || !this.rendered) return;
 
     if (content.items.length === 0) {
       // A scanned page. Not an error, and not worth retrying on every settle.
@@ -499,12 +576,12 @@ export class PdfPageView {
     } catch (thrown) {
       // A cancelled layer is this class cancelling it — a scroll, a zoom, a
       // closing tile — and says nothing about the engine.
-      this.#textLayerTask = null;
+      if (mine()) this.#textLayerTask = null;
       this.#syncEmptyClass();
-      if (!isCurrent() || isTextLayerCancellation(thrown)) return;
+      if (!mine() || !isCurrent() || isTextLayerCancellation(thrown)) return;
       throw new Error(`its text could not be laid out — ${describe(thrown)}`);
     }
-    if (!isCurrent()) return;
+    if (!mine() || !isCurrent()) return;
 
     this.#textLayerTask = null;
     this.#textLayerScale = scale;
@@ -524,6 +601,10 @@ export class PdfPageView {
   }
 
   #cancelTextLayer(): void {
+    // First, for the reason `cancelRender` bumps its counter first: a build that
+    // has not reached its `TextLayer` yet has nothing here to cancel.
+    this.#textLayerAttempt += 1;
+    this.#textLayerBuilding = null;
     try {
       this.#textLayerTask?.cancel();
     } catch {

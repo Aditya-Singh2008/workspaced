@@ -54,8 +54,9 @@ This is a native cross-platform desktop app, not a browser-deployed web app. Tau
 **Everything below was developed and verified on Linux.** Where a note says a thing is checked, it is checked there unless it says otherwise; what has never been run on macOS or Windows is listed under "Open items and unverified decisions" near the end of this file, and that list is the one to read before claiming any of this is settled. Keep the following in mind while implementing:
 
 - **Linux** renders through webkit2gtk, which trails Chromium and Safari on some CSS/JS features and varies by distro. Canvas-heavy rendering (PDF and image display are the core of this app) is the most likely place for inconsistencies to surface. Test on at least one Linux distro during Phase 3 and Phase 4, not only at the end.
-  - **The floor is webkit2gtk 2.44** (Safari 17.4, Chromium 119, Ubuntu 24.04 LTS), and it is a floor the app *holds up* rather than one the dependencies respect. `pdfjs-dist@5.5.207` calls ten built-ins newer than Safari 17.0 with no guard at all — `Promise.try`, `Uint8Array.prototype.toBase64`/`toHex` and `Uint8Array.fromBase64` (Safari 18.2), `URL.parse` (18.0), `Promise.withResolvers`, `AbortSignal.any` and `ArrayBuffer.prototype.transferToFixedLength` (17.4), `Map.prototype.getOrInsertComputed` (newer still, and the first thing `PDFPageProxy.render` touches), and `Set.prototype.intersection` (17.0, exactly at the floor). `src/viewers/pdf/compat.ts` polyfills all of them, on the main thread *and* inside the decoder worker, which is a separate global scope and needs its own copy.
+  - **The floor is webkit2gtk 2.44** (Safari 17.4, Chromium 119, Ubuntu 24.04 LTS), and it is a floor the app *holds up* rather than one the dependencies respect. `pdfjs-dist@5.5.207` calls eleven built-ins newer than Safari 17.0 with no guard at all — `Promise.try`, `Uint8Array.prototype.toBase64`/`toHex` and `Uint8Array.fromBase64` (Safari 18.2), `URL.parse` (18.0), `Promise.withResolvers`, `AbortSignal.any`, `ArrayBuffer.prototype.transferToFixedLength` and `ReadableStream.prototype[Symbol.asyncIterator]` (17.4), `Map.prototype.getOrInsertComputed` (newer still, and the first thing `PDFPageProxy.render` touches), and `Set.prototype.intersection` (17.0, exactly at the floor). `src/viewers/pdf/compat.ts` polyfills all of them, on the main thread *and* inside the decoder worker, which is a separate global scope and needs its own copy.
     **This bullet claimed the floor was "set by `Promise.withResolvers`". That claim was arrived at by reading the dependency, and reading the dependency was wrong three times running** — each time naming the newest API someone had noticed rather than the newest one present, and each time costing a bug report from a Mac. **Derive the list instead**: pull every method name pdf.js calls out of its sources, drop the ones that exist on a built-in in Node 20, and ask a modern webkit2gtk which of the survivors it recognises. What one engine has and the other lacks *is* the recent frontier, and it takes two minutes. `compat.ts` sets out both steps and the traps in reading the result — three of its hits are false. Then prove it by deleting that whole surface from a webkit2gtk page and from the worker blob and running the suite. Do all of it whenever the pdf.js pin moves.
+    **And that derivation has one blind spot, which cost a fourth bug report: it only sees built-ins something calls *by name*.** `ReadableStream.prototype[Symbol.asyncIterator]` is in the list above and no regex over `.method(` could have found it — pdf.js reaches it by writing `for await (const value of readableStream)`, where the syntax is the call. So also grep for the syntax that makes the engine call a protocol on your behalf: `for await` and `yield*`, spread and destructuring of non-arrays, `instanceof`. Of those, only `for await` over a stream lands anywhere near the frontier — everything else pdf.js iterates is its own arrays and maps, whose protocols are as old as the engine.
   - **Prefer a CSS `filter` on an element over `CanvasRenderingContext2D.filter`.** webkit2gtk *accepts* the canvas property, returns it verbatim when read back, and ignores it when drawing — so a feature probe that sets it and checks it says "supported" while every affected draw comes out untouched. The element-level filter has no such problem, is composited on the GPU, and leaves the canvas pixels alone. More generally: probe a capability by *using* it and measuring the result, never by asking whether the API exists.
   - **A `::selection` rule that sets only a background lets webkit2gtk choose the foreground**, and it chooses the GTK theme's selected-text colour — overriding `color: transparent` on the text underneath. Chromium and Firefox leave transparent text transparent, so this is invisible on two of the three engines. **Not on the third: WKWebView is WebKit too.** The rule in `pdf.css` is unconditional and is protecting macOS as well as Linux — do not narrow it on the reasoning that only webkit2gtk is affected. It surfaced in phase 05b as the PDF text layer becoming *visible* the moment it was selected: a second, offset copy of the words over the canvas's own, and on a scanned page the OCR text painted over the picture of itself. Any selection styling over invisible text has to name `color` **and** `-webkit-text-fill-color`; `src/viewers/pdf/pdf.css` does, and pdf.js's own stylesheet does not — do not "simplify" it back to theirs.
   - **webkit2gtk has no PDF renderer at all**, which WebView2 and WKWebView both do. Anything that hands a PDF to the webview and expects it to appear — a frame, an `<embed>`, a print preview — does nothing here. `src/viewers/pdf/print.ts` is the one place that matters so far, and it rasterises through pdf.js on Linux instead.
@@ -536,6 +537,32 @@ and the NSView path's status.
    rather than only the console — see the note in `instance.ts`.
    Confirm on a Mac: if pages are still blank the strip now names which of the three it
    is.
+4c. **Text unselectable on macOS — the same engine gap, one layer further on — and a
+   render collision found beside it.** Reported together: pages rendered, but nothing
+   could be selected, and the strip carried *two* messages. They were unrelated causes
+   that a slow engine surfaces at the same moment, and both are fixed and covered.
+   **The selection half was the engine gap again**, in the one place the derivation
+   above could not see: `PDFPageProxy.getTextContent` collects the decoder's answer with
+   `for await (const value of readableStream)`, and
+   `ReadableStream.prototype[Symbol.asyncIterator]` is Safari 17.4. Below that the loop
+   throws `TypeError: undefined is not a function` naming nothing, from a path only text
+   takes — so every page rendered and no page had words. `compat.ts` now supplies it
+   (`values` and the symbol, one implementation), and the blind spot is written up in
+   the floor bullet.
+   **The render half was ours, not the engine's.** `PdfPageView.render` claimed its slot
+   before the first `await` — which stopped a *concurrent* second render — but the slot
+   could be taken away while the call was suspended in `getPage`, and a suspended render
+   holds no task to cancel. It woke up and drew anyway, while the freed slot let the
+   zoom that cancelled it start a second render of the same canvas; pdf.js refuses that
+   outright with "Cannot use the same canvas during multiple render() operations". macOS
+   is where it surfaced because a cold decoder makes that window wide enough for the
+   opening fit-to-width to land inside it. Cancellation is now a counter that goes up
+   rather than a task to stop, and a suspended render compares it after every `await`;
+   the text layer got the same treatment, where two overlapping settle passes were
+   reading one page's text twice and laying out two `TextLayer`s into one container.
+   Both halves are verified on webkit2gtk with the shim defeated, and the render race
+   has a self-test check of its own — 30/30, and 29/30 with the fix reverted, failing
+   with exactly the reported sentence.
 5. **Printing through WKWebView's PDF renderer.** `print.ts` hands a blob URL to a
    hidden frame and calls `print()`, falling back to rasterising only if that *throws*.
    A frame that loads, accepts `print()` and produces a blank sheet reports success.
